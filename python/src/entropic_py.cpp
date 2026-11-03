@@ -114,11 +114,18 @@ NB_MODULE(_entropic, m) {
                                      uint32_t sx, uint32_t sy, uint32_t sz) {
             w.learn_from_sample(sample, sx, sy, sz);
         }, "sample"_a, "sx"_a, "sy"_a, "sz"_a = 1)
-#ifdef WFC_USE_FFTW
+#ifdef WFC_USE_FAF
         .def("set_gumbel_field", &World::set_gumbel_field,
              "H"_a, "noise_seed"_a)
         .def("set_matern_field", &World::set_matern_field,
              "kappa"_a, "nu"_a, "noise_seed"_a)
+#endif
+#ifdef WFC_ENABLE_HIERARCHY
+        .def("hierarchy_init", &World::hierarchy_init, "nlevels"_a)
+        .def("hierarchy_set_wavelet", &World::hierarchy_set_wavelet,
+             "family"_a, "dwt_levels"_a)
+        .def("hierarchy_collapse", &World::hierarchy_collapse,
+             nb::call_guard<nb::gil_scoped_release>())
 #endif
         .def("set_contradiction_callback", [](World& w, nb::object cb) {
             if (cb.is_none()) {

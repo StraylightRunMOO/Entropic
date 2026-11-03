@@ -81,10 +81,19 @@ contradiction.
 | mask_empty | loop | testz | vceq+and |
 | mask_popcnt | Harley-Seal | Harley-Seal | vcnt+vaddv |
 
-**Spectral priors** (`WFC_USE_FFTW`). An fBm or Matérn random field is
-generated via FFTW and stored as per-cell entropy bias. Cells in
-high-variance regions of the field collapse first, giving large-scale
-spatial coherence to the output without touching the constraint rules.
+**Spectral priors** (`WFC_USE_FAF`). An fBm or Matérn random field is
+generated via FastAndFourier's DWT (CDF 9/7 wavelets by default) and
+stored as per-cell entropy bias. Cells in high-variance regions of the
+field collapse first, giving large-scale spatial coherence to the output
+without touching the constraint rules.
+
+**Residual multiscale hierarchy** (`WFC_ENABLE_HIERARCHY`, requires
+`WFC_USE_FAF`). A coarse-to-fine cascade where the grid is solved at
+progressively finer resolutions. Each level creates a temporary world
+at that scale, biased by the residual between a target field and the
+upsampled coarser solution. The finest level copies its result back to
+the main world. Level dimensions are powers of two derived automatically
+from the grid dimensions.
 
 **Gaussian copula** (`WFC_ENABLE_COPULA`). Class-aware correlation via
 C-vine factorisation with precomputed Z-values. Patterns of the same class
@@ -144,7 +153,8 @@ not build the C++ or gtest suites.
 | `ENTROPIC_BUILD_EXAMPLES` | ON | All seven example binaries |
 | `ENTROPIC_ENABLE_AVX2` | OFF | AVX2 bitset operations (x86_64) |
 | `ENTROPIC_ENABLE_NEON` | OFF | ARM NEON bitset operations (aarch64) |
-| `ENTROPIC_USE_FFTW` | ON | Spectral field generation; auto-disables if FFTW not found |
+| `ENTROPIC_USE_FAF` | OFF | Wavelet spectral backend via FastAndFourier |
+| `ENTROPIC_ENABLE_HIERARCHY` | OFF | Residual multiscale hierarchy (requires FAF) |
 | `ENTROPIC_ENABLE_COPULA` | ON | Gaussian copula biasing |
 | `ENTROPIC_ENABLE_BACKTRACK` | ON | Delta-trail backtracking |
 | `ENTROPIC_ENABLE_SANITIZERS` | OFF | ASan + UBSan (Debug builds only) |
@@ -192,8 +202,12 @@ file includes the header and defines nothing.
 | `wfc_add_rule` | Add directional adjacency (A beside B going dir) |
 | `wfc_set_class_limit` | Hard min/max constraints per class |
 | `wfc_learn_from_sample` | Infer rules and frequencies from an example grid |
-| `wfc_set_gumbel_field` | Generate fBm spectral prior (requires FFTW) |
-| `wfc_set_matern_field` | Generate Matérn spectral prior (requires FFTW) |
+| `wfc_set_gumbel_field` | Generate fBm spectral prior (requires FAF) |
+| `wfc_set_matern_field` | Generate Matérn spectral prior (requires FAF) |
+| `wfc_hierarchy_init` | Set up N-level coarse-to-fine hierarchy (requires FAF + hierarchy) |
+| `wfc_hierarchy_set_wavelet` | Choose wavelet family and decomposition levels |
+| `wfc_hierarchy_set_target` | Provide a target field for residual biasing |
+| `wfc_hierarchy_collapse` | Solve via coarse-to-fine cascade |
 | `wfc_collapse` | Full WFC solve |
 | `wfc_step_init` / `wfc_step` / `wfc_step_done` | Step-by-step mode for visualisation |
 | `wfc_set_contradiction_callback` | Register a callback fired on contradiction |
@@ -256,10 +270,10 @@ re-acquire it.
   256 patterns is 4 words per cell, 32 bytes per mask. Raise it and the
   bitset operations, the compatibility table, and the per-cell size all
   grow. 64 is the default because most tile sets are small.
-- **Spectral fields need FFTW.** If FFTW3 is not found at configure time,
-  `wfc_set_gumbel_field` and `wfc_set_matern_field` are stubs that return
-  `WFC_EUNINIT`. The solver works fine without them; you just lose the
-  spatial bias.
+- **Spectral fields need FastAndFourier.** Build with
+  `-DENTROPIC_USE_FAF=ON` to enable `wfc_set_gumbel_field` and
+  `wfc_set_matern_field`. Without it the solver works fine; you just
+  lose the spatial bias. The multiscale hierarchy also requires FAF.
 - **Copula calibration is manual.** The library provides the machinery
   (`wfc_set_class_limit`, copula weight in config) but not a way to
   estimate correlation parameters from data. Bring your own Z-values, or

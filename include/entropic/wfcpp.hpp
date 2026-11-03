@@ -240,7 +240,7 @@ public:
     }
 
     /* -- Spectral fields -- */
-#ifdef WFC_USE_FFTW
+#ifdef WFC_USE_FAF
     void set_gumbel_field(double H, uint64_t noise_seed) {
         check();
         wfc_err_t err = wfc_set_gumbel_field(world_, H, noise_seed);
@@ -255,6 +255,36 @@ public:
         if (err == WFC_EUNINIT) throw Uninitialized("Spectral not enabled in config");
         if (err == WFC_ENOMEM) throw OutOfMemory("Failed to allocate spectral field");
         if (err != WFC_OK) throw Error("Failed to set Matérn field");
+    }
+#endif
+
+    /* -- Multiscale hierarchy -- */
+#ifdef WFC_ENABLE_HIERARCHY
+    void hierarchy_init(uint32_t nlevels) {
+        check();
+        wfc_err_t err = wfc_hierarchy_init(world_, nlevels);
+        if (err == WFC_EINVAL) throw InvalidArgument("Invalid hierarchy nlevels");
+        if (err == WFC_ENOMEM) throw OutOfMemory("Failed to allocate hierarchy");
+        if (err != WFC_OK) throw Error("Failed to init hierarchy");
+    }
+
+    void hierarchy_set_wavelet(int family, uint32_t dwt_levels) {
+        check();
+        wfc_err_t err = wfc_hierarchy_set_wavelet(world_, family, dwt_levels);
+        if (err != WFC_OK) throw Error("Failed to set wavelet");
+    }
+
+    void hierarchy_set_target(const float* target, uint32_t count) {
+        check();
+        wfc_err_t err = wfc_hierarchy_set_target(world_, target, count);
+        if (err != WFC_OK) throw Error("Failed to set target");
+    }
+
+    void hierarchy_collapse() {
+        check();
+        wfc_err_t err = wfc_hierarchy_collapse(world_);
+        if (err == WFC_ECONTRADICTION) throw Contradiction("hierarchy collapse");
+        if (err != WFC_OK) throw Error("Hierarchy collapse failed");
     }
 #endif
 

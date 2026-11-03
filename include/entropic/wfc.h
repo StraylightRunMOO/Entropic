@@ -9,7 +9,8 @@
  *   WFC_MAX_BACKTRACK_DEPTH   — snapshot stack depth (default 64)
  *   WFC_ENABLE_AVX2           — force AVX2 bitset paths
  *   WFC_ENABLE_NEON           — force NEON bitset paths
- *   WFC_USE_FFTW              — enable spectral Gumbel / Matérn / heat fields
+ *   WFC_USE_FAF               — enable spectral Gumbel / Matérn fields via FastAndFourier DWT
+ *   WFC_ENABLE_HIERARCHY      — enable residual multiscale hierarchy (requires WFC_USE_FAF)
  *   WFC_ENABLE_COPULA         — enable Gaussian copula entropy biasing
  *   WFC_ENABLE_BACKTRACK      — enable delta-trail backtracking
  *   WFC_MALLOC / WFC_FREE / WFC_REALLOC — allocator overrides
@@ -71,13 +72,17 @@
 #endif
 
 /* ============================================================
- * 3. Optional FFTW spectral backend
+ * 3. Optional wavelet spectral backend (FastAndFourier)
  * ============================================================ */
-#ifdef WFC_USE_FFTW
-#include <fftw3.h>
+#ifdef WFC_USE_FAF
+#include <fastandfourier.h>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+#endif
+
+#if defined(WFC_ENABLE_HIERARCHY) && !defined(WFC_USE_FAF)
+#error "WFC_ENABLE_HIERARCHY requires WFC_USE_FAF"
 #endif
 
 #include <stdint.h>
@@ -154,12 +159,34 @@ typedef struct {
     uint32_t nx, ny, nz;                /* requested output dimensions (nz=1 for 2D) */
     uint32_t seed;
     int      enable_backtracking;       /* requires WFC_ENABLE_BACKTRACK */
-    int      enable_spectral;           /* requires WFC_USE_FFTW */
+    int      enable_spectral;           /* requires WFC_USE_FAF */
     int      enable_copula;             /* requires WFC_ENABLE_COPULA */
     int      seamless;                  /* toroidal boundary conditions */
     float    spectral_weight;           /* scale of Gumbel/Matérn prior */
     float    copula_weight;             /* scale of copula prior */
 } wfc_config_t;
+
+/* Multiscale hierarchy types */
+#if defined(WFC_ENABLE_HIERARCHY)
+typedef struct wfc_scale {
+    uint32_t nx, ny;
+    uint32_t nx_p2, ny_p2;
+    uint32_t ncells;
+    float   *residual_field;
+    float   *recon_field;
+    uint16_t *coarse_codes;
+    float    weight;
+} wfc_scale_t;
+
+typedef struct wfc_hierarchy {
+    uint32_t       nlevels;
+    wfc_scale_t   *levels;
+    uint32_t       finest_idx;
+    int            wavelet_family;
+    uint32_t       wavelet_levels;
+    float         *target_field;
+} wfc_hierarchy_t;
+#endif
 
 /* Backtracking trail entry (delta snapshot) */
 typedef struct {
@@ -227,13 +254,16 @@ typedef struct wfc_world {
     int               contradiction;
 #endif
 
-    /* Spectral fields (FFTW) */
-#if defined(WFC_USE_FFTW)
-    float*    spectral_field;           /* additive entropy bias per cell */
-    fftw_plan fftw_plan_fwd;
-    fftw_plan fftw_plan_inv;
-    double*   fftw_workspace;
-    int       fftw_nx, fftw_ny;         /* power-of-two dims for FFTW */
+    /* Spectral fields (FastAndFourier DWT) */
+#if defined(WFC_USE_FAF)
+    float*          spectral_field;     /* additive entropy bias per cell */
+    faf_transform*  faf_row_fwd;
+    faf_transform*  faf_row_inv;
+    faf_transform*  faf_col_fwd;
+    faf_transform*  faf_col_inv;
+    float*          faf_workspace;      /* 2 * nx_p2 * ny_p2 interleaved */
+    float*          faf_col_buf;        /* 2 * max(nx_p2, ny_p2) temp */
+    int             faf_initialized;
 #endif
 
     /* Copula */
@@ -243,6 +273,12 @@ typedef struct wfc_world {
     float copula_marginal[WFC_MAX_CLASSES]; /* empirical CDF value per class */
     float copula_z[WFC_MAX_CLASSES];        /* PRECOMPUTED: Phi^{-1}(marginal[c]) */
     uint8_t copula_class_pop[WFC_MAX_CLASSES]; /* number of patterns in class */
+#endif
+
+    /* Multiscale hierarchy */
+#if defined(WFC_ENABLE_HIERARCHY)
+    wfc_hierarchy_t *hierarchy;
+    int              owns_compat;
 #endif
 
     /* RNG */
@@ -290,10 +326,19 @@ wfc_err_t wfc_set_class_limit(wfc_world_t* w, uint16_t class_id, uint32_t min_co
 wfc_err_t wfc_learn_from_sample(wfc_world_t* w, const uint16_t* sample_grid,
                                 uint32_t sx, uint32_t sy, uint32_t sz);
 
-/* Spectral priors (FFTW required). Call before wfc_collapse. */
-#if defined(WFC_USE_FFTW)
+/* Spectral priors (FAF DWT). Call before wfc_collapse. */
+#if defined(WFC_USE_FAF)
 wfc_err_t wfc_set_gumbel_field(wfc_world_t* w, double H, uint64_t noise_seed);
 wfc_err_t wfc_set_matern_field(wfc_world_t* w, double kappa, double nu, uint64_t noise_seed);
+#endif
+
+/* Multiscale hierarchy. Call wfc_hierarchy_init, then optionally set_wavelet/set_target, then collapse. */
+#if defined(WFC_ENABLE_HIERARCHY)
+wfc_err_t wfc_hierarchy_init(wfc_world_t* w, uint32_t nlevels);
+wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_levels);
+wfc_err_t wfc_hierarchy_set_target(wfc_world_t* w, const float* target, uint32_t count);
+wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w);
+void      wfc_hierarchy_destroy(wfc_world_t* w);
 #endif
 
 /* Solve: full collapse or step-by-step */
@@ -900,23 +945,10 @@ static inline void wfc_copula_update_cell(wfc_world_t* w, uint32_t cell_idx)
 
 #endif /* WFC_ENABLE_COPULA */
 
-/* --- Spectral field generation (FFTW) --- */
-#if defined(WFC_USE_FFTW)
+/* --- Spectral field generation (FastAndFourier DWT) --- */
+#if defined(WFC_USE_FAF)
 
-static inline void wfc_flandrin_spectrum(double* lambda, int n, double H)
-{
-    double pow_n_2H = pow((double)n, 2.0 * H);
-    double twoH_plus_1 = 2.0 * H + 1.0;
-    for (int k = 1; k < n; ++k) {
-        double s = sin(M_PI * (double)k / (2.0 * (double)n));
-        if (s < 1e-12) s = 1e-12;
-        lambda[k] = pow_n_2H * pow(s, -twoH_plus_1);
-    }
-    if (n >= 3) lambda[0] = lambda[1] * (lambda[1] / lambda[2]);
-    else if (n >= 2) lambda[0] = 2.0 * lambda[1];
-}
-
-static inline void wfc_fill_normal(double* buf, int n, uint64_t* rng)
+static inline void wfc_fill_normal_f(float* buf, int n, uint64_t* rng)
 {
     int i = 0;
     for (; i + 2 <= n; i += 2) {
@@ -924,141 +956,280 @@ static inline void wfc_fill_normal(double* buf, int n, uint64_t* rng)
         double u2 = wfc_randf(rng);
         double r = sqrt(-2.0 * log(u1));
         double t = 2.0 * M_PI * u2;
-        buf[i+0] = r * cos(t);
-        buf[i+1] = r * sin(t);
+        buf[i+0] = (float)(r * cos(t));
+        buf[i+1] = (float)(r * sin(t));
     }
     if (i < n) {
         double u1 = wfc_randf(rng); if (u1 < 1e-7) u1 = 1e-7;
         double u2 = wfc_randf(rng);
-        buf[i] = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+        buf[i] = (float)(sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2));
     }
 }
 
-static inline void wfc_gumbel_link(double* buf, int n)
+static inline void wfc_gumbel_link_f(float* buf, int n)
 {
     for (int i = 0; i < n; ++i) {
-        double u = 0.5 * erfc(-buf[i] * 0.7071067811865475);
+        double v = (double)buf[i];
+        double u = 0.5 * erfc(-v * 0.7071067811865475);
         if (u < 1e-15) u = 1e-15;
         if (u > 1.0 - 1e-15) u = 1.0 - 1e-15;
-        buf[i] = -log(-log(u));
+        buf[i] = (float)(-log(-log(u)));
+    }
+}
+
+static inline wfc_err_t wfc_faf_ensure_transforms(wfc_world_t* w)
+{
+    if (w->faf_initialized) return WFC_OK;
+
+    faf_init();
+
+    uint32_t nx = w->nx_p2, ny = w->ny_p2;
+    uint32_t max_dim = nx > ny ? nx : ny;
+    size_t levels_row = 0, levels_col = 0;
+    { uint32_t t = nx; while (t > 1) { t >>= 1; levels_row++; } }
+    { uint32_t t = ny; while (t > 1) { t >>= 1; levels_col++; } }
+
+    faf_config rc = faf_config_init(nx);
+    rc.family   = FAF_WAVELET_CDF97;
+    rc.levels   = levels_row;
+    rc.layout   = FAF_LAYOUT_INTERLEAVED;
+    w->faf_row_fwd = faf_create_dwt(&rc);
+    if (!w->faf_row_fwd) return WFC_ENOMEM;
+    w->faf_row_inv = faf_create_inverse(w->faf_row_fwd);
+    if (!w->faf_row_inv) return WFC_ENOMEM;
+
+    faf_config cc = faf_config_init(ny);
+    cc.family   = FAF_WAVELET_CDF97;
+    cc.levels   = levels_col;
+    cc.layout   = FAF_LAYOUT_INTERLEAVED;
+    w->faf_col_fwd = faf_create_dwt(&cc);
+    if (!w->faf_col_fwd) return WFC_ENOMEM;
+    w->faf_col_inv = faf_create_inverse(w->faf_col_fwd);
+    if (!w->faf_col_inv) return WFC_ENOMEM;
+
+    w->faf_workspace = (float*)faf_aligned_alloc(2 * (size_t)nx * ny * sizeof(float));
+    w->faf_col_buf   = (float*)faf_aligned_alloc(2 * (size_t)max_dim * sizeof(float));
+    if (!w->faf_workspace || !w->faf_col_buf) return WFC_ENOMEM;
+
+    w->faf_initialized = 1;
+    return WFC_OK;
+}
+
+/* Separable 2D forward DWT: rows then columns.
+ * Data is in interleaved layout: [re0,im0,re1,im1,...].
+ * Real data stored at even indices, im=0. */
+static inline void wfc_faf_dwt_2d_forward(wfc_world_t* w, float* data)
+{
+    uint32_t nx = w->nx_p2, ny = w->ny_p2;
+
+    /* Transform each row */
+    float* row_out = w->faf_workspace;
+    for (uint32_t j = 0; j < ny; ++j) {
+        float* row = data + j * 2 * nx;
+        faf_execute_f32(w->faf_row_fwd, row_out + j * 2 * nx, row);
+    }
+    memcpy(data, row_out, 2 * (size_t)nx * ny * sizeof(float));
+
+    /* Transform each column (strided access via col_buf) */
+    for (uint32_t i = 0; i < nx; ++i) {
+        float* col_buf = w->faf_col_buf;
+        for (uint32_t j = 0; j < ny; ++j) {
+            col_buf[2*j]   = data[j * 2 * nx + 2*i];
+            col_buf[2*j+1] = data[j * 2 * nx + 2*i+1];
+        }
+        float* col_out = w->faf_workspace;
+        faf_execute_f32(w->faf_col_fwd, col_out, col_buf);
+        for (uint32_t j = 0; j < ny; ++j) {
+            data[j * 2 * nx + 2*i]   = col_out[2*j];
+            data[j * 2 * nx + 2*i+1] = col_out[2*j+1];
+        }
+    }
+}
+
+static inline void wfc_faf_dwt_2d_inverse(wfc_world_t* w, float* data)
+{
+    uint32_t nx = w->nx_p2, ny = w->ny_p2;
+
+    /* Inverse columns first */
+    for (uint32_t i = 0; i < nx; ++i) {
+        float* col_buf = w->faf_col_buf;
+        for (uint32_t j = 0; j < ny; ++j) {
+            col_buf[2*j]   = data[j * 2 * nx + 2*i];
+            col_buf[2*j+1] = data[j * 2 * nx + 2*i+1];
+        }
+        float* col_out = w->faf_workspace;
+        faf_execute_f32(w->faf_col_inv, col_out, col_buf);
+        for (uint32_t j = 0; j < ny; ++j) {
+            data[j * 2 * nx + 2*i]   = col_out[2*j];
+            data[j * 2 * nx + 2*i+1] = col_out[2*j+1];
+        }
+    }
+
+    /* Inverse rows */
+    float* row_out = w->faf_workspace;
+    for (uint32_t j = 0; j < ny; ++j) {
+        float* row = data + j * 2 * nx;
+        faf_execute_f32(w->faf_row_inv, row_out + j * 2 * nx, row);
+    }
+    memcpy(data, row_out, 2 * (size_t)nx * ny * sizeof(float));
+}
+
+/* Scale DWT detail coefficients by 2^(j*H) per level (Flandrin). */
+static inline void wfc_faf_scale_flandrin(float* data, uint32_t nx, uint32_t ny,
+                                          uint32_t levels_x, uint32_t levels_y, double H)
+{
+    /* After separable 2D DWT the coefficient layout is a standard Mallat
+     * decomposition: at each level j the LL band is in the upper-left
+     * quadrant and detail bands (LH, HL, HH) fill the rest.  Level 0 is
+     * the finest (full-resolution details) and level max-1 is coarsest.
+     *
+     * We scale each coefficient at level j by 2^(j*H) so coarser detail
+     * bands get more energy — this is the wavelet-domain analogue of
+     * Flandrin's 1/f^(2H+1) spectral weighting. */
+    uint32_t bx = nx, by = ny;
+    for (uint32_t j = 0; j < levels_x && j < levels_y; ++j) {
+        float scale = (float)pow(2.0, (double)(j + 1) * H);
+        uint32_t hx = bx >> 1;
+        uint32_t hy = by >> 1;
+
+        /* LH band: rows [0, hy), cols [hx, bx) */
+        for (uint32_t r = 0; r < hy; ++r)
+            for (uint32_t c = hx; c < bx; ++c)
+                data[r * 2 * nx + 2 * c] *= scale;
+
+        /* HL band: rows [hy, by), cols [0, hx) */
+        for (uint32_t r = hy; r < by; ++r)
+            for (uint32_t c = 0; c < hx; ++c)
+                data[r * 2 * nx + 2 * c] *= scale;
+
+        /* HH band: rows [hy, by), cols [hx, bx) */
+        for (uint32_t r = hy; r < by; ++r)
+            for (uint32_t c = hx; c < bx; ++c)
+                data[r * 2 * nx + 2 * c] *= scale;
+
+        bx = hx;
+        by = hy;
+    }
+}
+
+/* Scale DWT coefficients by Matérn spectral density. */
+static inline void wfc_faf_scale_matern(float* data, uint32_t nx, uint32_t ny,
+                                        uint32_t levels_x, uint32_t levels_y,
+                                        double kappa, double nu)
+{
+    double kk = kappa * kappa;
+    uint32_t bx = nx, by = ny;
+    for (uint32_t j = 0; j < levels_x && j < levels_y; ++j) {
+        double freq = M_PI / (double)(1u << (j + 1));
+        double base = kk + freq * freq;
+        if (base < 1e-12) base = 1e-12;
+        float scale = (float)pow(base, -nu);
+        uint32_t hx = bx >> 1;
+        uint32_t hy = by >> 1;
+
+        for (uint32_t r = 0; r < hy; ++r)
+            for (uint32_t c = hx; c < bx; ++c)
+                data[r * 2 * nx + 2 * c] *= scale;
+        for (uint32_t r = hy; r < by; ++r)
+            for (uint32_t c = 0; c < hx; ++c)
+                data[r * 2 * nx + 2 * c] *= scale;
+        for (uint32_t r = hy; r < by; ++r)
+            for (uint32_t c = hx; c < bx; ++c)
+                data[r * 2 * nx + 2 * c] *= scale;
+
+        bx = hx;
+        by = hy;
     }
 }
 
 wfc_err_t wfc_set_gumbel_field(wfc_world_t* w, double H, uint64_t noise_seed)
 {
     if (!w || !w->spectral_enabled) return WFC_EUNINIT;
-    int nx = (int)w->nx_p2;
-    int ny = (int)w->ny_p2;
-    int n = nx * ny;
+    wfc_err_t err = wfc_faf_ensure_transforms(w);
+    if (err != WFC_OK) return err;
 
-    /* BUG FIX (v2.0): Check for stale plans and cleanup properly */
-    if (w->fftw_workspace && (w->fftw_nx != nx || w->fftw_ny != ny)) {
-        if (w->fftw_plan_fwd) fftw_destroy_plan(w->fftw_plan_fwd);
-        if (w->fftw_plan_inv) fftw_destroy_plan(w->fftw_plan_inv);
-        fftw_free(w->fftw_workspace);
-        w->fftw_workspace = NULL;
-        w->fftw_plan_fwd = NULL;
-        w->fftw_plan_inv = NULL;
-    }
+    uint32_t nx = w->nx_p2, ny = w->ny_p2;
+    uint32_t n = nx * ny;
+    uint32_t levels_x = 0, levels_y = 0;
+    { uint32_t t = nx; while (t > 1) { t >>= 1; levels_x++; } }
+    { uint32_t t = ny; while (t > 1) { t >>= 1; levels_y++; } }
 
-    if (!w->fftw_workspace) {
-        w->fftw_workspace = (double*)fftw_malloc((size_t)n * sizeof(double));
-        if (!w->fftw_workspace) return WFC_ENOMEM;
-        w->fftw_plan_fwd = fftw_plan_r2r_2d(ny, nx, w->fftw_workspace, w->fftw_workspace,
-                                             FFTW_REDFT10, FFTW_REDFT10, FFTW_ESTIMATE);
-        w->fftw_plan_inv = fftw_plan_r2r_2d(ny, nx, w->fftw_workspace, w->fftw_workspace,
-                                             FFTW_REDFT01, FFTW_REDFT01, FFTW_ESTIMATE);
-        w->fftw_nx = nx;
-        w->fftw_ny = ny;
-    }
-
-    double* lambda_x = (double*)WFC_MALLOC((size_t)nx * sizeof(double));
-    double* lambda_y = (double*)WFC_MALLOC((size_t)ny * sizeof(double));
-    if (!lambda_x || !lambda_y) { WFC_FREE(lambda_x); WFC_FREE(lambda_y); return WFC_ENOMEM; }
-
-    wfc_flandrin_spectrum(lambda_x, nx, H);
-    wfc_flandrin_spectrum(lambda_y, ny, H);
+    /* Interleaved buffer: 2*n floats (re,im pairs) */
+    float* buf = (float*)faf_aligned_alloc(2 * (size_t)n * sizeof(float));
+    if (!buf) return WFC_ENOMEM;
 
     uint64_t rng = noise_seed;
-    wfc_fill_normal(w->fftw_workspace, n, &rng);
-
-    fftw_execute(w->fftw_plan_fwd);
-
-    for (int j = 0; j < ny; ++j) {
-        double sy = sqrt(lambda_y[j]);
-        for (int i = 0; i < nx; ++i) {
-            double sx = sqrt(lambda_x[i]);
-            w->fftw_workspace[j * nx + i] *= (sx * sy);
+    for (uint32_t i = 0; i < n; ++i) {
+        double u1 = wfc_randf(&rng); if (u1 < 1e-7) u1 = 1e-7;
+        double u2 = wfc_randf(&rng);
+        double r = sqrt(-2.0 * log(u1));
+        double t = 2.0 * M_PI * u2;
+        buf[2*i]   = (float)(r * cos(t));
+        buf[2*i+1] = 0.0f;
+        if (i + 1 < n) {
+            buf[2*(i+1)]   = (float)(r * sin(t));
+            buf[2*(i+1)+1] = 0.0f;
+            ++i;
         }
     }
 
-    fftw_execute(w->fftw_plan_inv);
-    double norm = 1.0 / (4.0 * (double)nx * (double)ny);
-    for (int i = 0; i < n; ++i) w->fftw_workspace[i] *= norm;
+    wfc_faf_dwt_2d_forward(w, buf);
+    wfc_faf_scale_flandrin(buf, nx, ny, levels_x, levels_y, H);
+    wfc_faf_dwt_2d_inverse(w, buf);
 
-    wfc_gumbel_link(w->fftw_workspace, n);
-
+    /* Extract real parts and apply Gumbel link */
+    float* real_buf = w->spectral_field;
     for (uint32_t i = 0; i < w->num_cells; ++i)
-        w->spectral_field[i] = (float)w->fftw_workspace[i];
+        real_buf[i] = buf[2*i];
 
-    WFC_FREE(lambda_x);
-    WFC_FREE(lambda_y);
+    wfc_gumbel_link_f(real_buf, (int)w->num_cells);
+
+    faf_aligned_free(buf);
     return WFC_OK;
 }
 
 wfc_err_t wfc_set_matern_field(wfc_world_t* w, double kappa, double nu, uint64_t noise_seed)
 {
     if (!w || !w->spectral_enabled) return WFC_EUNINIT;
-    int nx = (int)w->nx_p2;
-    int ny = (int)w->ny_p2;
-    int n = nx * ny;
+    wfc_err_t err = wfc_faf_ensure_transforms(w);
+    if (err != WFC_OK) return err;
 
-    if (w->fftw_workspace && (w->fftw_nx != nx || w->fftw_ny != ny)) {
-        if (w->fftw_plan_fwd) fftw_destroy_plan(w->fftw_plan_fwd);
-        if (w->fftw_plan_inv) fftw_destroy_plan(w->fftw_plan_inv);
-        fftw_free(w->fftw_workspace);
-        w->fftw_workspace = NULL;
-        w->fftw_plan_fwd = NULL;
-        w->fftw_plan_inv = NULL;
-    }
-    if (!w->fftw_workspace) {
-        w->fftw_workspace = (double*)fftw_malloc((size_t)n * sizeof(double));
-        if (!w->fftw_workspace) return WFC_ENOMEM;
-        w->fftw_plan_fwd = fftw_plan_r2r_2d(ny, nx, w->fftw_workspace, w->fftw_workspace,
-                                             FFTW_REDFT10, FFTW_REDFT10, FFTW_ESTIMATE);
-        w->fftw_plan_inv = fftw_plan_r2r_2d(ny, nx, w->fftw_workspace, w->fftw_workspace,
-                                             FFTW_REDFT01, FFTW_REDFT01, FFTW_ESTIMATE);
-        w->fftw_nx = nx; w->fftw_ny = ny;
-    }
+    uint32_t nx = w->nx_p2, ny = w->ny_p2;
+    uint32_t n = nx * ny;
+    uint32_t levels_x = 0, levels_y = 0;
+    { uint32_t t = nx; while (t > 1) { t >>= 1; levels_x++; } }
+    { uint32_t t = ny; while (t > 1) { t >>= 1; levels_y++; } }
+
+    float* buf = (float*)faf_aligned_alloc(2 * (size_t)n * sizeof(float));
+    if (!buf) return WFC_ENOMEM;
 
     uint64_t rng = noise_seed;
-    wfc_fill_normal(w->fftw_workspace, n, &rng);
-    fftw_execute(w->fftw_plan_fwd);
-
-    double kk = kappa * kappa;
-    for (int j = 0; j < ny; ++j) {
-        double sy = sin(M_PI * (double)j / (2.0 * (double)ny));
-        double ly = 4.0 * sy * sy;
-        for (int i = 0; i < nx; ++i) {
-            double sx = sin(M_PI * (double)i / (2.0 * (double)nx));
-            double lx = 4.0 * sx * sx;
-            double base = kk + lx + ly;
-            if (base < 1e-12) base = 1e-12;
-            w->fftw_workspace[j * nx + i] *= pow(base, -nu);
+    for (uint32_t i = 0; i < n; ++i) {
+        double u1 = wfc_randf(&rng); if (u1 < 1e-7) u1 = 1e-7;
+        double u2 = wfc_randf(&rng);
+        double r = sqrt(-2.0 * log(u1));
+        double t = 2.0 * M_PI * u2;
+        buf[2*i]   = (float)(r * cos(t));
+        buf[2*i+1] = 0.0f;
+        if (i + 1 < n) {
+            buf[2*(i+1)]   = (float)(r * sin(t));
+            buf[2*(i+1)+1] = 0.0f;
+            ++i;
         }
     }
 
-    fftw_execute(w->fftw_plan_inv);
-    double norm = 1.0 / (4.0 * (double)nx * (double)ny);
-    for (int i = 0; i < n; ++i) w->fftw_workspace[i] *= norm;
+    wfc_faf_dwt_2d_forward(w, buf);
+    wfc_faf_scale_matern(buf, nx, ny, levels_x, levels_y, kappa, nu);
+    wfc_faf_dwt_2d_inverse(w, buf);
 
     for (uint32_t i = 0; i < w->num_cells; ++i)
-        w->spectral_field[i] = (float)w->fftw_workspace[i];
+        w->spectral_field[i] = buf[2*i];
 
+    faf_aligned_free(buf);
     return WFC_OK;
 }
 
-#endif /* WFC_USE_FFTW */
+#endif /* WFC_USE_FAF */
 
 /* --- Pattern choice --- */
 static inline uint16_t wfc_choose_pattern(wfc_world_t* w, const wfc_cell_t* cell)
@@ -1091,7 +1262,7 @@ static inline void wfc_ensure_entropy_fresh(wfc_world_t* w, uint32_t cell_idx)
     cell->entropy = wfc_cell_entropy(w, cell);
     cell->prior = 0.0f;
 
-#if defined(WFC_USE_FFTW)
+#if defined(WFC_USE_FAF)
     if (w->spectral_enabled && cell_idx < w->num_cells)
         cell->entropy += w->spectral_field[cell_idx] * w->spectral_weight;
 #endif
@@ -1240,7 +1411,7 @@ wfc_err_t wfc_collapse(wfc_world_t* w)
         cell->prior = 0.0f;
         cell->dirty = 0;
         cell->entropy += wfc_tiebreak_noise(w, i);
-#if defined(WFC_USE_FFTW)
+#if defined(WFC_USE_FAF)
         if (w->spectral_enabled) cell->entropy += w->spectral_field[i] * w->spectral_weight;
 #endif
         wfc_heap_insert(w, i);
@@ -1274,7 +1445,7 @@ wfc_err_t wfc_step_init(wfc_world_t* w)
         cell->prior = 0.0f;
         cell->dirty = 0;
         cell->entropy += wfc_tiebreak_noise(w, i);
-#if defined(WFC_USE_FFTW)
+#if defined(WFC_USE_FAF)
         if (w->spectral_enabled) cell->entropy += w->spectral_field[i] * w->spectral_weight;
 #endif
         wfc_heap_insert(w, i);
@@ -1396,7 +1567,7 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
 #endif
 
     /* Spectral */
-#if defined(WFC_USE_FFTW)
+#if defined(WFC_USE_FAF)
     w->spectral_enabled = cfg->enable_spectral;
     w->spectral_weight = cfg->spectral_weight;
     if (w->spectral_enabled) {
@@ -1404,12 +1575,13 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
         if (!w->spectral_field) goto fail;
         memset(w->spectral_field, 0, (size_t)w->num_cells * sizeof(float));
     }
-    /* BUG FIX (v2.0): Zero-initialize FFTW plan pointers */
-    w->fftw_plan_fwd = NULL;
-    w->fftw_plan_inv = NULL;
-    w->fftw_workspace = NULL;
-    w->fftw_nx = 0;
-    w->fftw_ny = 0;
+    w->faf_row_fwd = NULL;
+    w->faf_row_inv = NULL;
+    w->faf_col_fwd = NULL;
+    w->faf_col_inv = NULL;
+    w->faf_workspace = NULL;
+    w->faf_col_buf   = NULL;
+    w->faf_initialized = 0;
 #endif
 
     /* Copula */
@@ -1420,6 +1592,12 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
     memset(w->copula_marginal, 0, sizeof(w->copula_marginal));
     memset(w->copula_z, 0, sizeof(w->copula_z));
     memset(w->copula_class_pop, 0, sizeof(w->copula_class_pop));
+#endif
+
+    /* Hierarchy */
+#if defined(WFC_ENABLE_HIERARCHY)
+    w->hierarchy = NULL;
+    w->owns_compat = 1;
 #endif
 
     /* Class limits default to unlimited */
@@ -1438,11 +1616,16 @@ fail:
 void wfc_world_destroy(wfc_world_t* w)
 {
     if (!w) return;
-#if defined(WFC_USE_FFTW)
-    /* BUG FIX (v2.0): Properly cleanup FFTW resources */
-    if (w->fftw_plan_fwd) fftw_destroy_plan(w->fftw_plan_fwd);
-    if (w->fftw_plan_inv) fftw_destroy_plan(w->fftw_plan_inv);
-    if (w->fftw_workspace) fftw_free(w->fftw_workspace);
+#if defined(WFC_ENABLE_HIERARCHY)
+    if (w->hierarchy) wfc_hierarchy_destroy(w);
+#endif
+#if defined(WFC_USE_FAF)
+    if (w->faf_row_fwd) faf_destroy_transform(w->faf_row_fwd);
+    if (w->faf_row_inv) faf_destroy_transform(w->faf_row_inv);
+    if (w->faf_col_fwd) faf_destroy_transform(w->faf_col_fwd);
+    if (w->faf_col_inv) faf_destroy_transform(w->faf_col_inv);
+    if (w->faf_workspace) faf_aligned_free(w->faf_workspace);
+    if (w->faf_col_buf) faf_aligned_free(w->faf_col_buf);
     WFC_FREE(w->spectral_field);
 #endif
 #if defined(WFC_ENABLE_BACKTRACK)
@@ -1654,5 +1837,251 @@ void wfc_world_reset(wfc_world_t* w)
     if (w->trail_gen) memset(w->trail_gen, 0, w->num_cells * sizeof(uint32_t));
 #endif
 }
+
+/* --- Multiscale hierarchy --- */
+#if defined(WFC_ENABLE_HIERARCHY)
+
+wfc_err_t wfc_hierarchy_init(wfc_world_t* w, uint32_t nlevels)
+{
+    if (!w || nlevels < 2 || nlevels > 8) return WFC_EINVAL;
+    if (w->hierarchy) wfc_hierarchy_destroy(w);
+
+    wfc_hierarchy_t* h = (wfc_hierarchy_t*)WFC_MALLOC(sizeof(wfc_hierarchy_t));
+    if (!h) return WFC_ENOMEM;
+    memset(h, 0, sizeof(*h));
+
+    h->nlevels = nlevels;
+    h->finest_idx = nlevels - 1;
+    h->wavelet_family = FAF_WAVELET_CDF97;
+    h->wavelet_levels = 0;
+    h->target_field = NULL;
+
+    h->levels = (wfc_scale_t*)WFC_MALLOC(nlevels * sizeof(wfc_scale_t));
+    if (!h->levels) { WFC_FREE(h); return WFC_ENOMEM; }
+    memset(h->levels, 0, nlevels * sizeof(wfc_scale_t));
+
+    for (uint32_t k = 0; k < nlevels; ++k) {
+        uint32_t shift = nlevels - 1 - k;
+        uint32_t lnx = w->nx_p2 >> shift;
+        uint32_t lny = w->ny_p2 >> shift;
+        if (lnx < 4) lnx = 4;
+        if (lny < 4) lny = 4;
+
+        wfc_scale_t* s = &h->levels[k];
+        s->nx = lnx;
+        s->ny = lny;
+        s->nx_p2 = lnx;
+        s->ny_p2 = lny;
+        s->ncells = lnx * lny;
+        s->weight = 1.0f / (float)(1u << shift);
+
+        s->residual_field = (float*)WFC_MALLOC(s->ncells * sizeof(float));
+        s->recon_field    = (float*)WFC_MALLOC(s->ncells * sizeof(float));
+        s->coarse_codes   = (uint16_t*)WFC_MALLOC(s->ncells * sizeof(uint16_t));
+        if (!s->residual_field || !s->recon_field || !s->coarse_codes) {
+            wfc_hierarchy_destroy(w);
+            return WFC_ENOMEM;
+        }
+        memset(s->residual_field, 0, s->ncells * sizeof(float));
+        memset(s->recon_field, 0, s->ncells * sizeof(float));
+        for (uint32_t i = 0; i < s->ncells; ++i)
+            s->coarse_codes[i] = WFC_PATTERN_INVALID;
+    }
+
+    w->hierarchy = h;
+    return WFC_OK;
+}
+
+wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_levels)
+{
+    if (!w || !w->hierarchy) return WFC_EUNINIT;
+    w->hierarchy->wavelet_family = family;
+    w->hierarchy->wavelet_levels = dwt_levels;
+    return WFC_OK;
+}
+
+wfc_err_t wfc_hierarchy_set_target(wfc_world_t* w, const float* target, uint32_t count)
+{
+    if (!w || !w->hierarchy || !target) return WFC_EINVAL;
+    if (count != w->num_cells) return WFC_EINVAL;
+
+    if (!w->hierarchy->target_field) {
+        w->hierarchy->target_field = (float*)WFC_MALLOC(count * sizeof(float));
+        if (!w->hierarchy->target_field) return WFC_ENOMEM;
+    }
+    memcpy(w->hierarchy->target_field, target, count * sizeof(float));
+    return WFC_OK;
+}
+
+/* Create a temporary world at a given scale that shares pattern/compat data */
+static wfc_world_t* wfc_hierarchy_create_level_world(wfc_world_t* parent, const wfc_scale_t* scale)
+{
+    wfc_config_t cfg = {0};
+    cfg.nx = scale->nx;
+    cfg.ny = scale->ny;
+    cfg.nz = 1;
+    cfg.seed = (uint32_t)(parent->rng_state & 0xFFFFFFFF);
+    cfg.enable_spectral = parent->spectral_enabled;
+    cfg.spectral_weight = parent->spectral_weight;
+#if defined(WFC_ENABLE_COPULA)
+    cfg.enable_copula = parent->copula_enabled;
+    cfg.copula_weight = parent->copula_weight;
+#endif
+
+    wfc_world_t* lw = wfc_world_create(&cfg);
+    if (!lw) return NULL;
+
+    /* Copy pattern catalogue */
+    for (uint32_t i = 0; i < parent->num_patterns; ++i) {
+        wfc_add_pattern(lw, &parent->patterns[i]);
+    }
+
+    /* Copy compat table (shared, read-only) */
+    memcpy(lw->compat, parent->compat, sizeof(lw->compat));
+
+    /* Copy class limits */
+    memcpy(lw->class_min, parent->class_min, sizeof(lw->class_min));
+    memcpy(lw->class_max, parent->class_max, sizeof(lw->class_max));
+
+    return lw;
+}
+
+/* Upsample coarse codes to a float field at 2x resolution.
+ * Each coarse cell maps to a 2x2 block; value = pattern_weight / total_weight. */
+static void wfc_hierarchy_upsample(const wfc_world_t* parent,
+                                   const wfc_scale_t* coarse,
+                                   float* fine_field,
+                                   uint32_t fine_nx, uint32_t fine_ny)
+{
+    float total_weight = 0.0f;
+    for (uint32_t i = 0; i < parent->num_patterns; ++i)
+        total_weight += parent->patterns[i].weight;
+    if (total_weight < 1e-12f) total_weight = 1.0f;
+
+    for (uint32_t cy = 0; cy < coarse->ny; ++cy) {
+        for (uint32_t cx = 0; cx < coarse->nx; ++cx) {
+            uint16_t code = coarse->coarse_codes[cy * coarse->nx + cx];
+            float val = 0.0f;
+            if (code != WFC_PATTERN_INVALID && code < parent->num_patterns)
+                val = parent->patterns[code].weight / total_weight;
+
+            uint32_t fx = cx * 2, fy = cy * 2;
+            if (fx < fine_nx && fy < fine_ny) {
+                fine_field[fy * fine_nx + fx] = val;
+                if (fx + 1 < fine_nx)
+                    fine_field[fy * fine_nx + fx + 1] = val;
+                if (fy + 1 < fine_ny)
+                    fine_field[(fy+1) * fine_nx + fx] = val;
+                if (fx + 1 < fine_nx && fy + 1 < fine_ny)
+                    fine_field[(fy+1) * fine_nx + fx + 1] = val;
+            }
+        }
+    }
+}
+
+wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w)
+{
+    if (!w || !w->hierarchy) return WFC_EUNINIT;
+    wfc_hierarchy_t* h = w->hierarchy;
+
+    for (uint32_t k = 0; k < h->nlevels; ++k) {
+        wfc_scale_t* scale = &h->levels[k];
+
+        wfc_world_t* lw = wfc_hierarchy_create_level_world(w, scale);
+        if (!lw) return WFC_ENOMEM;
+
+        /* Set spectral bias for this level */
+        if (k == 0 && h->target_field && lw->spectral_enabled && lw->spectral_field) {
+            /* Project target to coarsest scale: simple averaging */
+            uint32_t ratio = w->nx_p2 / scale->nx;
+            for (uint32_t j = 0; j < scale->ny; ++j) {
+                for (uint32_t i = 0; i < scale->nx; ++i) {
+                    float sum = 0.0f;
+                    uint32_t count = 0;
+                    for (uint32_t dy = 0; dy < ratio && j * ratio + dy < w->ny_p2; ++dy) {
+                        for (uint32_t dx = 0; dx < ratio && i * ratio + dx < w->nx_p2; ++dx) {
+                            sum += h->target_field[(j * ratio + dy) * w->nx_p2 + (i * ratio + dx)];
+                            count++;
+                        }
+                    }
+                    if (count > 0) lw->spectral_field[j * scale->nx + i] = sum / (float)count;
+                }
+            }
+        } else if (k > 0 && lw->spectral_enabled && lw->spectral_field) {
+            /* Upsample previous level's codes, compute residual */
+            wfc_scale_t* prev = &h->levels[k - 1];
+            wfc_hierarchy_upsample(w, prev, scale->recon_field, scale->nx, scale->ny);
+
+            if (h->target_field) {
+                /* Compute residual: target_at_this_scale - reconstruction */
+                uint32_t ratio = w->nx_p2 / scale->nx;
+                for (uint32_t j = 0; j < scale->ny; ++j) {
+                    for (uint32_t i = 0; i < scale->nx; ++i) {
+                        float sum = 0.0f;
+                        uint32_t count = 0;
+                        for (uint32_t dy = 0; dy < ratio && j * ratio + dy < w->ny_p2; ++dy) {
+                            for (uint32_t dx = 0; dx < ratio && i * ratio + dx < w->nx_p2; ++dx) {
+                                sum += h->target_field[(j * ratio + dy) * w->nx_p2 + (i * ratio + dx)];
+                                count++;
+                            }
+                        }
+                        float target_val = (count > 0) ? sum / (float)count : 0.0f;
+                        scale->residual_field[j * scale->nx + i] =
+                            (target_val - scale->recon_field[j * scale->nx + i]) * scale->weight;
+                    }
+                }
+                memcpy(lw->spectral_field, scale->residual_field,
+                       scale->ncells * sizeof(float));
+            } else {
+                /* No target: use upsampled codes directly as bias */
+                for (uint32_t i = 0; i < scale->ncells; ++i)
+                    lw->spectral_field[i] = scale->recon_field[i] * scale->weight;
+            }
+        }
+
+        /* Collapse this level */
+        wfc_err_t err = wfc_collapse(lw);
+        if (err != WFC_OK) {
+            wfc_world_destroy(lw);
+            return err;
+        }
+
+        /* Export collapsed grid to coarse codes */
+        for (uint32_t i = 0; i < scale->ncells; ++i)
+            scale->coarse_codes[i] = lw->cells[i].collapsed;
+
+        /* If finest level, copy results back to main world */
+        if (k == h->finest_idx) {
+            for (uint32_t i = 0; i < w->num_cells && i < scale->ncells; ++i) {
+                w->cells[i].collapsed = lw->cells[i].collapsed;
+                memcpy(w->cells[i].mask, lw->cells[i].mask, sizeof(w->cells[i].mask));
+                w->cells[i].dirty = 0;
+            }
+        }
+
+        /* Advance parent RNG so next level gets different noise */
+        w->rng_state = lw->rng_state;
+        wfc_world_destroy(lw);
+    }
+
+    return WFC_OK;
+}
+
+void wfc_hierarchy_destroy(wfc_world_t* w)
+{
+    if (!w || !w->hierarchy) return;
+    wfc_hierarchy_t* h = w->hierarchy;
+    for (uint32_t k = 0; k < h->nlevels; ++k) {
+        WFC_FREE(h->levels[k].residual_field);
+        WFC_FREE(h->levels[k].recon_field);
+        WFC_FREE(h->levels[k].coarse_codes);
+    }
+    WFC_FREE(h->levels);
+    WFC_FREE(h->target_field);
+    WFC_FREE(h);
+    w->hierarchy = NULL;
+}
+
+#endif /* WFC_ENABLE_HIERARCHY */
 
 #endif /* WFC_IMPLEMENTATION */

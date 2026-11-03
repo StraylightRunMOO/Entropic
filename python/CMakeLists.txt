@@ -19,11 +19,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nanobind)
 
-# Optional FFTW for spectral features
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(FFTW QUIET fftw3)
-endif()
+# Optional FastAndFourier for spectral/wavelet features
+option(ENTROPIC_USE_FAF "Enable FastAndFourier wavelet backend" OFF)
 
 # Build the extension module
 nanobind_add_module(_entropic src/entropic_py.cpp)
@@ -45,10 +42,25 @@ target_compile_definitions(_entropic PRIVATE
     WFC_ENABLE_BACKTRACK
 )
 
-if(FFTW_FOUND)
-    target_compile_definitions(_entropic PRIVATE WFC_USE_FFTW)
-    target_link_libraries(_entropic PRIVATE ${FFTW_LIBRARIES})
-    target_include_directories(_entropic PRIVATE ${FFTW_INCLUDE_DIRS})
+if(ENTROPIC_USE_FAF)
+    FetchContent_Declare(
+        fastandfourier
+        GIT_REPOSITORY https://github.com/NotoriousLOB/FastAndFourier.git
+        GIT_TAG        master
+        GIT_SHALLOW    TRUE
+    )
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(ENABLE_FP8 OFF CACHE BOOL "" FORCE)
+    set(ENABLE_FP16 OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(fastandfourier)
+    target_include_directories(fastandfourier PUBLIC
+        ${fastandfourier_SOURCE_DIR}/include
+        ${fastandfourier_SOURCE_DIR}/src)
+    target_compile_definitions(_entropic PRIVATE WFC_USE_FAF)
+    target_link_libraries(_entropic PRIVATE fastandfourier)
 endif()
 
 # Install into the Python package directory

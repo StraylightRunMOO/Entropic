@@ -15,7 +15,8 @@ option(ENTROPIC_BUILD_EXAMPLES    "Build examples" ON)
 option(ENTROPIC_ENABLE_AVX2       "Enable AVX2 SIMD paths (x86_64)" OFF)
 option(ENTROPIC_ENABLE_NEON       "Enable NEON SIMD paths (aarch64)" OFF)
 option(ENTROPIC_ENABLE_SANITIZERS "Enable ASan/UBSan in Debug builds" OFF)
-option(ENTROPIC_USE_FFTW          "Enable FFTW spectral backend" ON)
+option(ENTROPIC_USE_FAF            "Enable FastAndFourier wavelet backend" OFF)
+option(ENTROPIC_ENABLE_HIERARCHY   "Enable multiscale hierarchy (requires FAF)" OFF)
 option(ENTROPIC_ENABLE_COPULA     "Enable Gaussian copula entropy biasing" ON)
 option(ENTROPIC_ENABLE_BACKTRACK  "Enable delta-trail backtracking" ON)
 option(ENTROPIC_BUILD_PYTHON      "Build Python bindings (requires nanobind)" OFF)
@@ -82,36 +83,46 @@ elseif(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# FetchContent for FFTW (optional) and Google Test
+# FetchContent dependencies
 # ---------------------------------------------------------------------------
 include(FetchContent)
 
-if(ENTROPIC_USE_FFTW)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(FFTW QUIET fftw3)
+if(ENTROPIC_USE_FAF)
+    FetchContent_Declare(
+        fastandfourier
+        GIT_REPOSITORY https://github.com/NotoriousLOB/FastAndFourier.git
+        GIT_TAG        master
+        GIT_SHALLOW    TRUE
+    )
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(ENABLE_FP8 OFF CACHE BOOL "" FORCE)
+    set(ENABLE_FP16 OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(fastandfourier)
+    # FAF's CMakeLists uses CMAKE_SOURCE_DIR (wrong when consumed via
+    # FetchContent).  Patch include dirs on the target directly.
+    target_include_directories(fastandfourier PUBLIC
+        ${fastandfourier_SOURCE_DIR}/include
+        ${fastandfourier_SOURCE_DIR}/src)
+    target_compile_definitions(wfc INTERFACE WFC_USE_FAF)
+    target_compile_definitions(wfcpp INTERFACE WFC_USE_FAF)
+    target_link_libraries(wfc INTERFACE $<BUILD_INTERFACE:fastandfourier>)
+    target_link_libraries(wfcpp INTERFACE $<BUILD_INTERFACE:fastandfourier>)
+    target_include_directories(wfc INTERFACE
+        $<BUILD_INTERFACE:${fastandfourier_SOURCE_DIR}/include>)
+    target_include_directories(wfcpp INTERFACE
+        $<BUILD_INTERFACE:${fastandfourier_SOURCE_DIR}/include>)
+    message(STATUS "FastAndFourier enabled (wavelet backend)")
+endif()
+
+if(ENTROPIC_ENABLE_HIERARCHY)
+    if(NOT ENTROPIC_USE_FAF)
+        message(FATAL_ERROR "ENTROPIC_ENABLE_HIERARCHY requires ENTROPIC_USE_FAF")
     endif()
-    if(NOT FFTW_FOUND)
-        find_library(FFTW_LIB fftw3)
-        find_path(FFTW_INC fftw3.h)
-        if(FFTW_LIB AND FFTW_INC)
-            set(FFTW_FOUND TRUE)
-            set(FFTW_LIBRARIES ${FFTW_LIB})
-            set(FFTW_INCLUDE_DIRS ${FFTW_INC})
-        endif()
-    endif()
-    if(NOT FFTW_FOUND)
-        message(STATUS "FFTW not found; spectral features disabled.")
-        set(ENTROPIC_USE_FFTW OFF)
-    else()
-        target_compile_definitions(wfc INTERFACE WFC_USE_FFTW)
-        target_compile_definitions(wfcpp INTERFACE WFC_USE_FFTW)
-        target_link_libraries(wfc INTERFACE ${FFTW_LIBRARIES})
-        target_link_libraries(wfcpp INTERFACE ${FFTW_LIBRARIES})
-        target_include_directories(wfc INTERFACE ${FFTW_INCLUDE_DIRS})
-        target_include_directories(wfcpp INTERFACE ${FFTW_INCLUDE_DIRS})
-        message(STATUS "FFTW found: ${FFTW_LIBRARIES}")
-    endif()
+    target_compile_definitions(wfc INTERFACE WFC_ENABLE_HIERARCHY)
+    target_compile_definitions(wfcpp INTERFACE WFC_ENABLE_HIERARCHY)
 endif()
 
 if(ENTROPIC_BUILD_TESTS)
@@ -142,6 +153,20 @@ if(ENTROPIC_BUILD_TESTS)
     add_executable(test_wfc_cpp tests/test_wfc_cpp.cpp)
     target_link_libraries(test_wfc_cpp PRIVATE wfcpp)
     add_test(NAME wfc_cpp COMMAND test_wfc_cpp)
+
+    if(ENTROPIC_USE_FAF)
+        add_executable(test_faf_smoke tests/test_faf_dwt.c)
+        target_link_libraries(test_faf_smoke PRIVATE fastandfourier m)
+        target_include_directories(test_faf_smoke PRIVATE
+            ${fastandfourier_SOURCE_DIR}/include)
+        add_test(NAME faf_smoke COMMAND test_faf_smoke)
+    endif()
+
+    if(ENTROPIC_ENABLE_HIERARCHY)
+        add_executable(test_hierarchy tests/test_hierarchy.c)
+        target_link_libraries(test_hierarchy PRIVATE wfc m)
+        add_test(NAME hierarchy COMMAND test_hierarchy)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -183,14 +208,17 @@ if(ENTROPIC_BUILD_EXAMPLES)
     target_link_libraries(example_kowloon PRIVATE wfc)
     target_link_libraries(example_kowloon PRIVATE m)
 
-    if(ENTROPIC_USE_FFTW)
+    if(ENTROPIC_USE_FAF)
         add_executable(example_spectral examples/example_spectral.c)
-        target_link_libraries(example_spectral PRIVATE wfc)
-	target_link_libraries(example_spectral PRIVATE m)
+        target_link_libraries(example_spectral PRIVATE wfc m)
+    endif()
 
-        add_executable(example_copula examples/example_copula.c)
-        target_link_libraries(example_copula PRIVATE wfc)
-	target_link_libraries(example_copula PRIVATE m)
+    add_executable(example_copula examples/example_copula.c)
+    target_link_libraries(example_copula PRIVATE wfc m)
+
+    if(ENTROPIC_ENABLE_HIERARCHY)
+        add_executable(example_hierarchy examples/example_hierarchy.c)
+        target_link_libraries(example_hierarchy PRIVATE wfc m)
     endif()
 endif()
 
@@ -215,10 +243,12 @@ if(ENTROPIC_BUILD_PYTHON)
         WFC_ENABLE_COPULA
         WFC_ENABLE_BACKTRACK
     )
-    if(ENTROPIC_USE_FFTW AND FFTW_FOUND)
-        target_compile_definitions(_entropic PRIVATE WFC_USE_FFTW)
-        target_link_libraries(_entropic PRIVATE ${FFTW_LIBRARIES})
-        target_include_directories(_entropic PRIVATE ${FFTW_INCLUDE_DIRS})
+    if(ENTROPIC_USE_FAF)
+        target_compile_definitions(_entropic PRIVATE WFC_USE_FAF)
+        target_link_libraries(_entropic PRIVATE fastandfourier)
+    endif()
+    if(ENTROPIC_ENABLE_HIERARCHY)
+        target_compile_definitions(_entropic PRIVATE WFC_ENABLE_HIERARCHY)
     endif()
     install(TARGETS _entropic LIBRARY DESTINATION lib/python/entropic)
 endif()
