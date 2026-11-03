@@ -17,6 +17,7 @@
 #include "entropic/wfc.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 static wfc_world_t* make_world(uint32_t nx, uint32_t ny, uint32_t seed)
@@ -129,6 +130,49 @@ static void test_set_wavelet(void)
     assert(err == WFC_OK);
     assert(w->hierarchy->wavelet_family == FAF_WAVELET_HAAR);
     assert(w->hierarchy->wavelet_levels == 3);
+
+    /* The knob must turn something, not just store a value: generate the
+     * same field under two different wavelet families and require the
+     * fields to differ. */
+    static float field_a[32 * 32];
+    err = wfc_set_gumbel_field(w, 0.7, 99);
+    assert(err == WFC_OK);
+    memcpy(field_a, w->spectral_field, sizeof(field_a));
+
+    err = wfc_hierarchy_set_wavelet(w, FAF_WAVELET_CDF97, 0);
+    assert(err == WFC_OK);
+    err = wfc_set_gumbel_field(w, 0.7, 99);
+    assert(err == WFC_OK);
+
+    int differs = 0;
+    for (uint32_t i = 0; i < 32 * 32; ++i)
+        if (w->spectral_field[i] != field_a[i]) differs = 1;
+    assert(differs && "wavelet family had no effect on the field");
+
+    wfc_world_destroy(w);
+    printf(" PASS\n");
+}
+
+static void test_no_spectral_no_silent_cascade(void)
+{
+    printf("  no spectral, no silent cascade...");
+    wfc_config_t cfg = {0};
+    cfg.nx = 16;
+    cfg.ny = 16;
+    cfg.nz = 1;
+    cfg.seed = 11;
+    cfg.enable_spectral = 0;
+
+    wfc_world_t* w = wfc_world_create(&cfg);
+    assert(w && "world create failed");
+    wfc_pattern_def_t p0 = {0, 0, 5.0f};
+    wfc_add_pattern(w, &p0);
+    for (int d = 0; d < 4; ++d) wfc_add_rule(w, 0, 0, d);
+
+    assert(wfc_hierarchy_init(w, 2) == WFC_OK);
+    /* Without the spectral bias there is no inter-level coupling, so the
+     * collapse must refuse rather than return a flat solve in costume. */
+    assert(wfc_hierarchy_collapse(w) == WFC_EUNINIT);
 
     wfc_world_destroy(w);
     printf(" PASS\n");
@@ -274,6 +318,7 @@ int main(void)
     test_two_level_collapse();
     test_three_level_collapse();
     test_set_wavelet();
+    test_no_spectral_no_silent_cascade();
     test_with_target();
     test_residual_nonzero();
     test_finest_writes_back();
