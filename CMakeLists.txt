@@ -17,6 +17,7 @@ option(ENTROPIC_ENABLE_NEON       "Enable NEON SIMD paths (aarch64)" OFF)
 option(ENTROPIC_ENABLE_SANITIZERS "Enable ASan/UBSan in Debug builds" OFF)
 option(ENTROPIC_USE_FAF            "Enable FastAndFourier wavelet backend" OFF)
 option(ENTROPIC_ENABLE_HIERARCHY   "Enable multiscale hierarchy (requires FAF)" OFF)
+option(ENTROPIC_ENABLE_SUSPENDERS  "Enable suspenders.h coroutine parallelism (requires FAF)" OFF)
 option(ENTROPIC_ENABLE_COPULA     "Enable Gaussian copula entropy biasing" ON)
 option(ENTROPIC_ENABLE_BACKTRACK  "Enable delta-trail backtracking" ON)
 option(ENTROPIC_BUILD_PYTHON      "Build Python bindings (requires nanobind)" OFF)
@@ -125,6 +126,65 @@ if(ENTROPIC_ENABLE_HIERARCHY)
     target_compile_definitions(wfcpp INTERFACE WFC_ENABLE_HIERARCHY)
 endif()
 
+if(ENTROPIC_ENABLE_SUSPENDERS)
+    if(NOT ENTROPIC_USE_FAF)
+        message(FATAL_ERROR "ENTROPIC_ENABLE_SUSPENDERS requires ENTROPIC_USE_FAF")
+    endif()
+
+    # Memento (header-only allocator, required by suspenders)
+    FetchContent_Declare(
+        memento
+        GIT_REPOSITORY https://github.com/StraylightRunMOO/memento.git
+        GIT_TAG        v3.0.0
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_Populate(memento)
+
+    # Suspenders (header-only coroutines)
+    FetchContent_Declare(
+        suspenders
+        GIT_REPOSITORY https://github.com/StraylightRunMOO/suspenders.h.git
+        GIT_TAG        master
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_Populate(suspenders)
+
+    target_compile_definitions(wfc INTERFACE WFC_ENABLE_SUSPENDERS)
+    target_compile_definitions(wfcpp INTERFACE WFC_ENABLE_SUSPENDERS)
+    target_include_directories(wfc INTERFACE
+        $<BUILD_INTERFACE:${suspenders_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${memento_SOURCE_DIR}/include>)
+    target_include_directories(wfcpp INTERFACE
+        $<BUILD_INTERFACE:${suspenders_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${memento_SOURCE_DIR}/include>)
+
+    # Suspenders needs pthreads
+    find_package(Threads REQUIRED)
+    target_link_libraries(wfc INTERFACE Threads::Threads)
+    target_link_libraries(wfcpp INTERFACE Threads::Threads)
+
+    # Auto-detect liburing on Linux; fall back to poll backend if absent
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(LIBURING QUIET liburing>=2.0)
+        endif()
+        if(LIBURING_FOUND)
+            target_include_directories(wfc INTERFACE ${LIBURING_INCLUDE_DIRS})
+            target_link_libraries(wfc INTERFACE ${LIBURING_LIBRARIES})
+            target_include_directories(wfcpp INTERFACE ${LIBURING_INCLUDE_DIRS})
+            target_link_libraries(wfcpp INTERFACE ${LIBURING_LIBRARIES})
+            message(STATUS "Suspenders: using io_uring backend")
+        else()
+            target_compile_definitions(wfc INTERFACE SUSPENDERS_FORCE_POLL)
+            target_compile_definitions(wfcpp INTERFACE SUSPENDERS_FORCE_POLL)
+            message(STATUS "Suspenders: liburing not found, using poll backend")
+        endif()
+    endif()
+
+    message(STATUS "Suspenders.h coroutine parallelism enabled")
+endif()
+
 if(ENTROPIC_BUILD_TESTS)
     FetchContent_Declare(
         googletest
@@ -166,6 +226,12 @@ if(ENTROPIC_BUILD_TESTS)
         add_executable(test_hierarchy tests/test_hierarchy.c)
         target_link_libraries(test_hierarchy PRIVATE wfc m)
         add_test(NAME hierarchy COMMAND test_hierarchy)
+    endif()
+
+    if(ENTROPIC_ENABLE_SUSPENDERS)
+        add_executable(test_suspenders tests/test_suspenders.c)
+        target_link_libraries(test_suspenders PRIVATE wfc m)
+        add_test(NAME suspenders COMMAND test_suspenders)
     endif()
 endif()
 
@@ -249,6 +315,19 @@ if(ENTROPIC_BUILD_PYTHON)
     endif()
     if(ENTROPIC_ENABLE_HIERARCHY)
         target_compile_definitions(_entropic PRIVATE WFC_ENABLE_HIERARCHY)
+    endif()
+    if(ENTROPIC_ENABLE_SUSPENDERS)
+        target_compile_definitions(_entropic PRIVATE WFC_ENABLE_SUSPENDERS)
+        target_include_directories(_entropic PRIVATE
+            ${suspenders_SOURCE_DIR}/include
+            ${memento_SOURCE_DIR}/include)
+        target_link_libraries(_entropic PRIVATE Threads::Threads)
+        if(LIBURING_FOUND)
+            target_include_directories(_entropic PRIVATE ${LIBURING_INCLUDE_DIRS})
+            target_link_libraries(_entropic PRIVATE ${LIBURING_LIBRARIES})
+        else()
+            target_compile_definitions(_entropic PRIVATE SUSPENDERS_FORCE_POLL)
+        endif()
     endif()
     install(TARGETS _entropic LIBRARY DESTINATION lib/python/entropic)
 endif()

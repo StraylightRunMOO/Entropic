@@ -127,6 +127,10 @@ NB_MODULE(_entropic, m) {
         .def("hierarchy_collapse", &World::hierarchy_collapse,
              nb::call_guard<nb::gil_scoped_release>())
 #endif
+#ifdef WFC_ENABLE_SUSPENDERS
+        .def("parallel_init", &World::parallel_init, "num_workers"_a = 0)
+        .def("parallel_shutdown", &World::parallel_shutdown)
+#endif
         .def("set_contradiction_callback", [](World& w, nb::object cb) {
             if (cb.is_none()) {
                 w.set_contradiction_callback(nullptr);

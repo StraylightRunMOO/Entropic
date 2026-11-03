@@ -85,6 +85,31 @@
 #error "WFC_ENABLE_HIERARCHY requires WFC_USE_FAF"
 #endif
 
+/* ============================================================
+ * 3b. Optional coroutine parallelism (suspenders.h)
+ * ============================================================ */
+#if defined(WFC_ENABLE_SUSPENDERS) && !defined(WFC_USE_FAF)
+#error "WFC_ENABLE_SUSPENDERS requires WFC_USE_FAF"
+#endif
+
+#ifdef WFC_ENABLE_SUSPENDERS
+#ifdef WFC_IMPLEMENTATION
+#ifndef MEMENTO_IMPLEMENTATION
+#define MEMENTO_IMPLEMENTATION
+#endif
+#ifndef SUSPENDERS_IMPLEMENTATION
+#define SUSPENDERS_IMPLEMENTATION
+#endif
+#endif /* WFC_IMPLEMENTATION */
+#include <memento.h>
+#include <suspenders.h>
+#include <stdatomic.h>
+#include <sched.h>
+#ifndef WFC_PAR_MIN_DIM
+#define WFC_PAR_MIN_DIM 32
+#endif
+#endif /* WFC_ENABLE_SUSPENDERS */
+
 #include <stdint.h>
 #include <string.h>
 #include <float.h>
@@ -281,6 +306,13 @@ typedef struct wfc_world {
     int              owns_compat;
 #endif
 
+    /* Coroutine parallelism */
+#if defined(WFC_ENABLE_SUSPENDERS)
+    int              susp_initialized;
+    unsigned         susp_num_workers;
+    float           *faf_par_scratch;    /* 4 * nx_p2 * ny_p2, column DWT pool */
+#endif
+
     /* RNG */
     uint64_t rng_state;
 
@@ -339,6 +371,12 @@ wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_lev
 wfc_err_t wfc_hierarchy_set_target(wfc_world_t* w, const float* target, uint32_t count);
 wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w);
 void      wfc_hierarchy_destroy(wfc_world_t* w);
+#endif
+
+/* Coroutine parallelism. Call wfc_parallel_init before spectral/hierarchy operations. */
+#if defined(WFC_ENABLE_SUSPENDERS)
+wfc_err_t wfc_parallel_init(wfc_world_t* w, unsigned num_workers);
+void      wfc_parallel_shutdown(wfc_world_t* w);
 #endif
 
 /* Solve: full collapse or step-by-step */
@@ -1015,11 +1053,24 @@ static inline wfc_err_t wfc_faf_ensure_transforms(wfc_world_t* w)
     return WFC_OK;
 }
 
+/* Forward declarations for parallel DWT paths */
+#if defined(WFC_ENABLE_SUSPENDERS)
+static inline void wfc_faf_dwt_2d_forward_par(wfc_world_t* w, float* data);
+static inline void wfc_faf_dwt_2d_inverse_par(wfc_world_t* w, float* data);
+static inline void wfc_fill_noise_par(float* buf, uint32_t n, uint64_t noise_seed, unsigned nw);
+#endif
+
 /* Separable 2D forward DWT: rows then columns.
  * Data is in interleaved layout: [re0,im0,re1,im1,...].
  * Real data stored at even indices, im=0. */
 static inline void wfc_faf_dwt_2d_forward(wfc_world_t* w, float* data)
 {
+#if defined(WFC_ENABLE_SUSPENDERS)
+    if (w->susp_initialized && w->nx_p2 >= WFC_PAR_MIN_DIM && w->ny_p2 >= WFC_PAR_MIN_DIM) {
+        wfc_faf_dwt_2d_forward_par(w, data);
+        return;
+    }
+#endif
     uint32_t nx = w->nx_p2, ny = w->ny_p2;
 
     /* Transform each row */
@@ -1048,6 +1099,12 @@ static inline void wfc_faf_dwt_2d_forward(wfc_world_t* w, float* data)
 
 static inline void wfc_faf_dwt_2d_inverse(wfc_world_t* w, float* data)
 {
+#if defined(WFC_ENABLE_SUSPENDERS)
+    if (w->susp_initialized && w->nx_p2 >= WFC_PAR_MIN_DIM && w->ny_p2 >= WFC_PAR_MIN_DIM) {
+        wfc_faf_dwt_2d_inverse_par(w, data);
+        return;
+    }
+#endif
     uint32_t nx = w->nx_p2, ny = w->ny_p2;
 
     /* Inverse columns first */
@@ -1158,18 +1215,25 @@ wfc_err_t wfc_set_gumbel_field(wfc_world_t* w, double H, uint64_t noise_seed)
     float* buf = (float*)faf_aligned_alloc(2 * (size_t)n * sizeof(float));
     if (!buf) return WFC_ENOMEM;
 
-    uint64_t rng = noise_seed;
-    for (uint32_t i = 0; i < n; ++i) {
-        double u1 = wfc_randf(&rng); if (u1 < 1e-7) u1 = 1e-7;
-        double u2 = wfc_randf(&rng);
-        double r = sqrt(-2.0 * log(u1));
-        double t = 2.0 * M_PI * u2;
-        buf[2*i]   = (float)(r * cos(t));
-        buf[2*i+1] = 0.0f;
-        if (i + 1 < n) {
-            buf[2*(i+1)]   = (float)(r * sin(t));
-            buf[2*(i+1)+1] = 0.0f;
-            ++i;
+#if defined(WFC_ENABLE_SUSPENDERS)
+    if (w->susp_initialized && n >= WFC_PAR_MIN_DIM * WFC_PAR_MIN_DIM) {
+        wfc_fill_noise_par(buf, n, noise_seed, w->susp_num_workers);
+    } else
+#endif
+    {
+        uint64_t rng = noise_seed;
+        for (uint32_t i = 0; i < n; ++i) {
+            double u1 = wfc_randf(&rng); if (u1 < 1e-7) u1 = 1e-7;
+            double u2 = wfc_randf(&rng);
+            double r = sqrt(-2.0 * log(u1));
+            double t = 2.0 * M_PI * u2;
+            buf[2*i]   = (float)(r * cos(t));
+            buf[2*i+1] = 0.0f;
+            if (i + 1 < n) {
+                buf[2*(i+1)]   = (float)(r * sin(t));
+                buf[2*(i+1)+1] = 0.0f;
+                ++i;
+            }
         }
     }
 
@@ -1203,18 +1267,25 @@ wfc_err_t wfc_set_matern_field(wfc_world_t* w, double kappa, double nu, uint64_t
     float* buf = (float*)faf_aligned_alloc(2 * (size_t)n * sizeof(float));
     if (!buf) return WFC_ENOMEM;
 
-    uint64_t rng = noise_seed;
-    for (uint32_t i = 0; i < n; ++i) {
-        double u1 = wfc_randf(&rng); if (u1 < 1e-7) u1 = 1e-7;
-        double u2 = wfc_randf(&rng);
-        double r = sqrt(-2.0 * log(u1));
-        double t = 2.0 * M_PI * u2;
-        buf[2*i]   = (float)(r * cos(t));
-        buf[2*i+1] = 0.0f;
-        if (i + 1 < n) {
-            buf[2*(i+1)]   = (float)(r * sin(t));
-            buf[2*(i+1)+1] = 0.0f;
-            ++i;
+#if defined(WFC_ENABLE_SUSPENDERS)
+    if (w->susp_initialized && n >= WFC_PAR_MIN_DIM * WFC_PAR_MIN_DIM) {
+        wfc_fill_noise_par(buf, n, noise_seed, w->susp_num_workers);
+    } else
+#endif
+    {
+        uint64_t rng = noise_seed;
+        for (uint32_t i = 0; i < n; ++i) {
+            double u1 = wfc_randf(&rng); if (u1 < 1e-7) u1 = 1e-7;
+            double u2 = wfc_randf(&rng);
+            double r = sqrt(-2.0 * log(u1));
+            double t = 2.0 * M_PI * u2;
+            buf[2*i]   = (float)(r * cos(t));
+            buf[2*i+1] = 0.0f;
+            if (i + 1 < n) {
+                buf[2*(i+1)]   = (float)(r * sin(t));
+                buf[2*(i+1)+1] = 0.0f;
+                ++i;
+            }
         }
     }
 
@@ -1600,6 +1671,13 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
     w->owns_compat = 1;
 #endif
 
+    /* Suspenders */
+#if defined(WFC_ENABLE_SUSPENDERS)
+    w->susp_initialized = 0;
+    w->susp_num_workers = 0;
+    w->faf_par_scratch = NULL;
+#endif
+
     /* Class limits default to unlimited */
     for (int i = 0; i < WFC_MAX_CLASSES; ++i) {
         w->class_min[i] = 0;
@@ -1616,6 +1694,9 @@ fail:
 void wfc_world_destroy(wfc_world_t* w)
 {
     if (!w) return;
+#if defined(WFC_ENABLE_SUSPENDERS)
+    if (w->susp_initialized) wfc_parallel_shutdown(w);
+#endif
 #if defined(WFC_ENABLE_HIERARCHY)
     if (w->hierarchy) wfc_hierarchy_destroy(w);
 #endif
@@ -2083,5 +2164,340 @@ void wfc_hierarchy_destroy(wfc_world_t* w)
 }
 
 #endif /* WFC_ENABLE_HIERARCHY */
+
+/* ============================================================
+ * Suspenders.h coroutine parallelism
+ * ============================================================ */
+#if defined(WFC_ENABLE_SUSPENDERS)
+
+/* --- Atomic barrier for foreign-thread synchronization --- */
+
+typedef struct {
+    atomic_uint_fast32_t remaining;
+} wfc_par_sync_t;
+
+static inline void wfc_par_sync_init(wfc_par_sync_t* s, uint32_t count)
+{
+    atomic_store_explicit(&s->remaining, count, memory_order_release);
+}
+
+static inline void wfc_par_sync_done(wfc_par_sync_t* s)
+{
+    atomic_fetch_sub_explicit(&s->remaining, 1, memory_order_acq_rel);
+}
+
+static inline void wfc_par_sync_wait(wfc_par_sync_t* s)
+{
+    while (atomic_load_explicit(&s->remaining, memory_order_acquire) > 0)
+        sched_yield();
+}
+
+/* --- Task descriptors --- */
+
+typedef struct {
+    faf_transform *xform;
+    float         *src;
+    float         *dst;
+    wfc_par_sync_t *sync;
+} wfc_par_row_task_t;
+
+static void wfc_par_row_fn(void* arg)
+{
+    wfc_par_row_task_t* t = (wfc_par_row_task_t*)arg;
+    faf_execute_f32(t->xform, t->dst, t->src);
+    wfc_par_sync_done(t->sync);
+}
+
+typedef struct {
+    faf_transform *xform;
+    float         *data;        /* full 2D interleaved buffer */
+    float         *col_buf;     /* private gather buffer (2*ny) */
+    float         *col_out;     /* private output buffer (2*ny) */
+    uint32_t       col_idx;
+    uint32_t       nx;
+    uint32_t       ny;
+    wfc_par_sync_t *sync;
+} wfc_par_col_task_t;
+
+static void wfc_par_col_fn(void* arg)
+{
+    wfc_par_col_task_t* t = (wfc_par_col_task_t*)arg;
+    uint32_t i = t->col_idx;
+    uint32_t nx = t->nx, ny = t->ny;
+
+    /* Gather column from strided 2D layout */
+    for (uint32_t j = 0; j < ny; ++j) {
+        t->col_buf[2*j]   = t->data[j * 2 * nx + 2*i];
+        t->col_buf[2*j+1] = t->data[j * 2 * nx + 2*i+1];
+    }
+
+    faf_execute_f32(t->xform, t->col_out, t->col_buf);
+
+    /* Scatter back */
+    for (uint32_t j = 0; j < ny; ++j) {
+        t->data[j * 2 * nx + 2*i]   = t->col_out[2*j];
+        t->data[j * 2 * nx + 2*i+1] = t->col_out[2*j+1];
+    }
+
+    wfc_par_sync_done(t->sync);
+}
+
+typedef struct {
+    float    *buf;
+    uint32_t  start;
+    uint32_t  end;
+    uint64_t  rng_seed;
+    wfc_par_sync_t *sync;
+} wfc_par_noise_task_t;
+
+static void wfc_par_noise_fn(void* arg)
+{
+    wfc_par_noise_task_t* t = (wfc_par_noise_task_t*)arg;
+    uint64_t rng = t->rng_seed;
+    for (uint32_t i = t->start; i < t->end; i += 2) {
+        double u1 = ((double)((rng = rng * 6364136223846793005ULL + 1442695040888963407ULL) >> 33) / (double)(1ULL << 31));
+        double u2 = ((double)((rng = rng * 6364136223846793005ULL + 1442695040888963407ULL) >> 33) / (double)(1ULL << 31));
+        if (u1 < 1e-7) u1 = 1e-7;
+        double r = sqrt(-2.0 * log(u1));
+        double th = 2.0 * M_PI * u2;
+        t->buf[2*i]   = (float)(r * cos(th));
+        t->buf[2*i+1] = 0.0f;
+        if (i + 1 < t->end) {
+            t->buf[2*(i+1)]   = (float)(r * sin(th));
+            t->buf[2*(i+1)+1] = 0.0f;
+        }
+    }
+    wfc_par_sync_done(t->sync);
+}
+
+/* --- Parallel 2D DWT --- */
+
+static inline void wfc_faf_dwt_2d_forward_par(wfc_world_t* w, float* data)
+{
+    uint32_t nx = w->nx_p2, ny = w->ny_p2;
+
+    /* Row pass: each row is independent */
+    {
+        wfc_par_sync_t sync;
+        wfc_par_sync_init(&sync, ny);
+        wfc_par_row_task_t* tasks = (wfc_par_row_task_t*)WFC_MALLOC(ny * sizeof(wfc_par_row_task_t));
+        float* row_out = w->faf_workspace;
+        for (uint32_t j = 0; j < ny; ++j) {
+            tasks[j].xform = w->faf_row_fwd;
+            tasks[j].src   = data + j * 2 * nx;
+            tasks[j].dst   = row_out + j * 2 * nx;
+            tasks[j].sync  = &sync;
+            suspenders_go(wfc_par_row_fn, &tasks[j]);
+        }
+        wfc_par_sync_wait(&sync);
+        memcpy(data, row_out, 2 * (size_t)nx * ny * sizeof(float));
+        WFC_FREE(tasks);
+    }
+
+    /* Column pass: each column is independent, needs private buffers */
+    {
+        wfc_par_sync_t sync;
+        wfc_par_sync_init(&sync, nx);
+        wfc_par_col_task_t* tasks = (wfc_par_col_task_t*)WFC_MALLOC(nx * sizeof(wfc_par_col_task_t));
+        float* scratch = w->faf_par_scratch;
+        for (uint32_t i = 0; i < nx; ++i) {
+            tasks[i].xform   = w->faf_col_fwd;
+            tasks[i].data    = data;
+            tasks[i].col_buf = scratch + i * 4 * ny;       /* 2*ny for gather */
+            tasks[i].col_out = scratch + i * 4 * ny + 2*ny; /* 2*ny for output */
+            tasks[i].col_idx = i;
+            tasks[i].nx      = nx;
+            tasks[i].ny      = ny;
+            tasks[i].sync    = &sync;
+            suspenders_go(wfc_par_col_fn, &tasks[i]);
+        }
+        wfc_par_sync_wait(&sync);
+        WFC_FREE(tasks);
+    }
+}
+
+static inline void wfc_faf_dwt_2d_inverse_par(wfc_world_t* w, float* data)
+{
+    uint32_t nx = w->nx_p2, ny = w->ny_p2;
+
+    /* Inverse column pass first */
+    {
+        wfc_par_sync_t sync;
+        wfc_par_sync_init(&sync, nx);
+        wfc_par_col_task_t* tasks = (wfc_par_col_task_t*)WFC_MALLOC(nx * sizeof(wfc_par_col_task_t));
+        float* scratch = w->faf_par_scratch;
+        for (uint32_t i = 0; i < nx; ++i) {
+            tasks[i].xform   = w->faf_col_inv;
+            tasks[i].data    = data;
+            tasks[i].col_buf = scratch + i * 4 * ny;
+            tasks[i].col_out = scratch + i * 4 * ny + 2*ny;
+            tasks[i].col_idx = i;
+            tasks[i].nx      = nx;
+            tasks[i].ny      = ny;
+            tasks[i].sync    = &sync;
+            suspenders_go(wfc_par_col_fn, &tasks[i]);
+        }
+        wfc_par_sync_wait(&sync);
+        WFC_FREE(tasks);
+    }
+
+    /* Inverse row pass */
+    {
+        wfc_par_sync_t sync;
+        wfc_par_sync_init(&sync, ny);
+        wfc_par_row_task_t* tasks = (wfc_par_row_task_t*)WFC_MALLOC(ny * sizeof(wfc_par_row_task_t));
+        float* row_out = w->faf_workspace;
+        for (uint32_t j = 0; j < ny; ++j) {
+            tasks[j].xform = w->faf_row_inv;
+            tasks[j].src   = data + j * 2 * nx;
+            tasks[j].dst   = row_out + j * 2 * nx;
+            tasks[j].sync  = &sync;
+            suspenders_go(wfc_par_row_fn, &tasks[j]);
+        }
+        wfc_par_sync_wait(&sync);
+        memcpy(data, row_out, 2 * (size_t)nx * ny * sizeof(float));
+        WFC_FREE(tasks);
+    }
+}
+
+/* --- Parallel noise generation --- */
+
+static inline void wfc_fill_noise_par(float* buf, uint32_t n, uint64_t noise_seed,
+                                      unsigned num_workers)
+{
+    uint32_t chunk = (n + num_workers - 1) / num_workers;
+    /* Round up to even for Box-Muller pairs */
+    if (chunk & 1) chunk++;
+    uint32_t ntasks = (n + chunk - 1) / chunk;
+
+    wfc_par_sync_t sync;
+    wfc_par_sync_init(&sync, ntasks);
+    wfc_par_noise_task_t* tasks = (wfc_par_noise_task_t*)WFC_MALLOC(ntasks * sizeof(wfc_par_noise_task_t));
+    for (uint32_t k = 0; k < ntasks; ++k) {
+        tasks[k].buf      = buf;
+        tasks[k].start    = k * chunk;
+        tasks[k].end      = (k + 1) * chunk < n ? (k + 1) * chunk : n;
+        tasks[k].rng_seed = noise_seed ^ ((uint64_t)k * 0x9E3779B97F4A7C15ULL);
+        tasks[k].sync     = &sync;
+        suspenders_go(wfc_par_noise_fn, &tasks[k]);
+    }
+    wfc_par_sync_wait(&sync);
+    WFC_FREE(tasks);
+}
+
+/* --- Process-level suspenders singleton ---
+ *
+ * The suspenders runtime (init/run/shutdown) must execute on the same
+ * thread, and memento.h's per-CPU heap cache is not cleared across
+ * shutdown/reinit cycles, causing UAF. We avoid this by starting the
+ * runtime once and never tearing it down — the keepalive coroutine
+ * keeps suspenders_run blocking indefinitely. Worker threads stay
+ * alive for the process lifetime; per-world resources (scratch buffers)
+ * are allocated/freed normally.
+ */
+
+static atomic_int  wfc_susp_up       = 0;
+static pthread_t   wfc_susp_thread;
+static atomic_int  wfc_susp_ready;
+static atomic_int  wfc_susp_init_err;
+static unsigned    wfc_susp_nworkers;
+
+typedef struct {
+    unsigned num_workers;
+} wfc_par_boot_t;
+
+static void wfc_par_keepalive_fn(void* arg)
+{
+    (void)arg;
+    /* Block forever — keeps suspenders_run from returning. */
+    for (;;) suspenders_suspend();
+}
+
+static void* wfc_par_run_thread_fn(void* arg)
+{
+    wfc_par_boot_t *boot = (wfc_par_boot_t*)arg;
+
+    int err = suspenders_init(boot->num_workers, 0);
+    if (err != SUSPENDERS_OK) {
+        atomic_store_explicit(&wfc_susp_init_err, 1, memory_order_release);
+        atomic_store_explicit(&wfc_susp_ready, 1, memory_order_release);
+        return NULL;
+    }
+
+    suspenders_cr_t *ka = suspenders_go(wfc_par_keepalive_fn, NULL);
+    if (!ka) {
+        suspenders_shutdown();
+        atomic_store_explicit(&wfc_susp_init_err, 1, memory_order_release);
+        atomic_store_explicit(&wfc_susp_ready, 1, memory_order_release);
+        return NULL;
+    }
+    (void)ka;
+
+    atomic_store_explicit(&wfc_susp_init_err, 0, memory_order_release);
+    atomic_store_explicit(&wfc_susp_ready, 1, memory_order_release);
+
+    suspenders_run();
+    return NULL;
+}
+
+static int wfc_susp_singleton_start(unsigned num_workers)
+{
+    static wfc_par_boot_t boot;
+    boot.num_workers = num_workers;
+
+    atomic_store_explicit(&wfc_susp_ready, 0, memory_order_release);
+    atomic_store_explicit(&wfc_susp_init_err, 0, memory_order_release);
+
+    if (pthread_create(&wfc_susp_thread, NULL, wfc_par_run_thread_fn, &boot) != 0)
+        return -1;
+
+    while (!atomic_load_explicit(&wfc_susp_ready, memory_order_acquire))
+        sched_yield();
+
+    if (atomic_load_explicit(&wfc_susp_init_err, memory_order_acquire)) {
+        pthread_join(wfc_susp_thread, NULL);
+        return -1;
+    }
+    wfc_susp_nworkers = num_workers;
+    return 0;
+}
+
+wfc_err_t wfc_parallel_init(wfc_world_t* w, unsigned num_workers)
+{
+    if (!w) return WFC_EINVAL;
+    if (w->susp_initialized) return WFC_OK;
+    if (num_workers == 0) num_workers = 4;
+
+    int was_up = atomic_exchange_explicit(&wfc_susp_up, 1, memory_order_acq_rel);
+    if (!was_up) {
+        if (wfc_susp_singleton_start(num_workers) != 0) {
+            atomic_store_explicit(&wfc_susp_up, 0, memory_order_release);
+            return WFC_ENOMEM;
+        }
+    }
+
+    w->susp_num_workers = wfc_susp_nworkers;
+
+    size_t scratch_sz = 4 * (size_t)w->nx_p2 * w->ny_p2 * sizeof(float);
+    w->faf_par_scratch = (float*)WFC_MALLOC(scratch_sz);
+    if (!w->faf_par_scratch) {
+        return WFC_ENOMEM;
+    }
+
+    w->susp_initialized = 1;
+    return WFC_OK;
+}
+
+void wfc_parallel_shutdown(wfc_world_t* w)
+{
+    if (!w || !w->susp_initialized) return;
+    w->susp_initialized = 0;
+    WFC_FREE(w->faf_par_scratch);
+    w->faf_par_scratch = NULL;
+    w->susp_num_workers = 0;
+    /* Runtime stays alive — no teardown. */
+}
+
+#endif /* WFC_ENABLE_SUSPENDERS */
 
 #endif /* WFC_IMPLEMENTATION */

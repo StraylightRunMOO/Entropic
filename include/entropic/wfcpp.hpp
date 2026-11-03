@@ -288,6 +288,21 @@ public:
     }
 #endif
 
+    /* -- Coroutine parallelism -- */
+#ifdef WFC_ENABLE_SUSPENDERS
+    void parallel_init(unsigned num_workers = 0) {
+        check();
+        wfc_err_t err = wfc_parallel_init(world_, num_workers);
+        if (err == WFC_ENOMEM) throw OutOfMemory("Failed to init parallel runtime");
+        if (err != WFC_OK) throw Error("Failed to init parallel runtime");
+    }
+
+    void parallel_shutdown() {
+        check();
+        wfc_parallel_shutdown(world_);
+    }
+#endif
+
     /* -- Contradiction callback -- */
     using ContradictionCallback = std::function<void(uint32_t x, uint32_t y, uint32_t z)>;
 
