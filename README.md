@@ -66,55 +66,60 @@ ecosystem alongside
 holds a `uint64_t mask[]` bitset of valid patterns, a collapsed ID, cached
 entropy, an optional spectral/copula prior, and a dirty flag.
 
-**Observe.** A binary min-heap tracks cells by entropy. The cheapest cell
-is popped in O(log n) and collapsed to one pattern by weighted random
-selection with a SplitMix64 PRNG. Tie-breaking uses deterministic
-micro-noise to prevent directional artifacts.
+**Observe.** A binary min-heap tracks cells by Shannon entropy of the
+patterns still in the mask, `log2(Z) - (Σ w log2 w) / Z`. A singleton is
+exactly 0. The cheapest cell is popped, and if a stale key is no longer
+the minimum it goes back on the heap. Collapse samples the posterior with
+a SplitMix64 PRNG. Tie-breaking hashes the original seed and the cell index.
 
-**Propagate (AC-3).** Neighbours of the collapsed cell are enqueued in a
-ring buffer. For each queued cell, the mask is ANDed against the precomputed
-compatibility table `compat[dir][pat][block]`. If the mask changed, the
-cell's neighbours are enqueued. If the mask is empty, that is a
-contradiction.
+**Propagate (AC-3).** A cell may keep a pattern only when some pattern still
+alive in the neighbor allows it. That allowed set is the OR of
+`compat[dir][p]` over the neighbor's mask (one row, once the neighbor has
+collapsed). The solver runs this to a fixpoint before the first observe and
+again after every domain change. An empty mask is a contradiction. On a
+torus the neighbor is the wrapped logical cell, including when the grid is
+not a power of two.
 
-**Bitset SIMD.** Mask operations dispatch at compile time:
+**Bitset SIMD.** The mask is at most 256 bits, so the matching widths are
+AVX2 and two NEON registers. AVX-512 does not widen the op. The paths turn
+on when the translation unit was compiled with that ISA.
 
 | Operation | Scalar | AVX2 | NEON |
 |---|---|---|---|
-| mask_and | loop | 256-bit | 2×128-bit |
-| mask_andnot | loop | 256-bit | 2×128-bit |
-| mask_empty | loop | testz | vceq+and |
-| mask_popcnt | Harley-Seal | Harley-Seal | vcnt+vaddv |
+| mask_and / or / andnot | loop | 256-bit | 2×128-bit |
+| mask_empty / eq | loop | testz / cmpeq | XOR-OR reduce |
+| mask_popcnt | hardware popcnt | hardware popcnt | vcnt+vaddv |
 
 **Spectral priors** (`WFC_USE_FAF`). An fBm or Matérn random field is
-generated via FastAndFourier's DWT (CDF 9/7 wavelets by default) and
-stored as per-cell entropy bias. Cells in high-variance regions of the
-field collapse first, giving large-scale spatial coherence to the output
-without touching the constraint rules.
+generated via FastAndFourier's DWT (CDF 9/7 wavelets by default),
+standardized to zero mean and unit variance, and stored as per-cell entropy
+bias. The fBm field is then passed through the Gumbel link `-log(-log Φ(x))`.
+Low regions of the field collapse first. This orders observe; it does not
+change pattern weights.
 
 **Residual multiscale hierarchy** (`WFC_ENABLE_HIERARCHY`, requires
-`WFC_USE_FAF`). A coarse-to-fine cascade where the grid is solved at
-progressively finer resolutions. Each level creates a temporary world
-at that scale, biased by the residual between a target field and the
-upsampled coarser solution. The finest level copies its result back to
-the main world.
+`WFC_USE_FAF`). A coarse-to-fine cascade. Each level solves a temporary
+world whose patterns are scored by a Gaussian likelihood on their
+signatures. The finest level copies its result back to the main world.
 
 ### How the residual hierarchy works
 
-Level sizes are derived by successive right-shifts of the padded
-dimensions (`nx_p2`, `ny_p2`), with a minimum of 4 on each axis.
-`wfc_hierarchy_init` returns `WFC_EINVAL` if `nlevels` is outside
-`[2, 8]` or if the coarsest scale would fall below 4×4. Weights scale
-as `1 / 2^shift`. The residual at level *k* is the difference between
-the target (or, with no target, zero) projected onto that scale by
-box-averaging logical cells, and the **1-level inverse DWT** of the
-coarser level's **pattern signatures** (class bin plus a unique
-pattern-id sub-quantum — weights do not enter). `wfc_hierarchy_set_wavelet`
-selects that DWT family (Haar is piecewise-constant 2×2; CDF 9/7
-interpolates) and the family used by Gumbel/Matérn synthesis. The residual
-field both orders observe (entropy) and Gumbel-tilts `wfc_choose_pattern`
-toward signatures that match the target. There is no direct pattern
-locking from coarse codes.
+Level sizes are successive right-shifts of the padded dimensions, minimum
+4 on each axis. `wfc_hierarchy_init` returns `WFC_EINVAL` if `nlevels` is
+outside `[2, 8]` or the coarsest scale would fall below 4×4. The data
+blend is `α = 2^(-shift)` (1 at the finest level).
+
+The likelihood observes a signature, the same embedding the upsampler
+writes: class bin plus a unique pattern-id sub-quantum. Weights do not
+enter. With a user field, the coarsest observation is that field
+low-passed by a 1-level DWT. Each finer observation is
+`(1-α) * upsample(coarse signatures) + α * projected target`. With no
+user field the coarsest solve is ordinary WFC, and finer levels observe
+the upsampled signatures directly. `wfc_hierarchy_set_wavelet` selects
+the DWT family (Haar is piecewise-constant 2×2; CDF 9/7 interpolates)
+and the family used by Gumbel/Matérn synthesis. Pattern choice samples
+`weight * exp(-|λ| (sig - observation)²)`. Observe uses the Shannon
+entropy of that posterior. Coarse ids are not locked into the finer world.
 
 ```c
 wfc_hierarchy_init(w, 3);                         /* 8×8 → 16×16 → 32×32 */
@@ -126,13 +131,15 @@ wfc_hierarchy_collapse(w);                        /* writes back to w */
 See `examples/example_hierarchy.c` and `python/examples/wavelets.py`.
 
 **Gaussian copula** (`WFC_ENABLE_COPULA`). Class-aware correlation via
-C-vine factorisation with precomputed Z-values. Patterns of the same class
-cluster together — "desert next to desert" — without adding explicit
-adjacency rules for every pair.
+the bivariate Gaussian copula density (not the conditional CDF), with
+precomputed Z-values. A collapsed neighbor reweights pattern choice by
+that density, so classes cluster — "desert next to desert" — without an
+adjacency rule for every pair. The same posterior is what the heap orders.
 
 **Delta-trail backtracking** (`WFC_ENABLE_BACKTRACK`). On contradiction,
 the solver rewinds to the last branch point by replaying a stack of cell
-mask diffs. No full grid copies.
+mask diffs, including the cell that was just observed. Class counts come
+back from the snapshot taken before that observe. No full grid copies.
 
 **Class limits.** Hard min/max constraints per pattern class. The solver
 tracks class population during collapse and masks out patterns whose class

@@ -355,6 +355,10 @@ TEST(bitset_ops) {
     assert(wfc_mask_popcnt(b) == 64);  /* 32 bits in each of b[0] and b[1] */
     assert(wfc_mask_empty(b) == 0);
 
+    uint64_t o[4] = {0, 0, 0, 0};
+    wfc_mask_or(o, b);
+    assert(o[0] == b[0] && o[1] == b[1] && o[2] == 0 && o[3] == 0);
+
     uint64_t e[4] = {0, 0, 0, 0};
     assert(wfc_mask_empty(e) == 1);
 }
@@ -682,6 +686,86 @@ TEST(spectral_odd_cells_and_fill) {
 }
 #endif
 
+/* Shannon entropy of the masked weights, not a sum of global -p log p. */
+TEST(shannon_entropy) {
+    wfc_config_t cfg = {1, 1, 1, 1, 0, 0, 0, 0, 1.0f, 1.0f};
+    wfc_world_t* w = wfc_world_create(&cfg);
+    wfc_pattern_def_t p0 = {0, 0, 1.0f, 0, 0, {0}};
+    wfc_pattern_def_t p1 = {1, 0, 1.0f, 0, 0, {0}};
+    wfc_add_pattern(w, &p0);
+    wfc_add_pattern(w, &p1);
+    wfc_prepare_weights(w);
+    wfc_cell_t* c = &w->cells[0];
+    c->mask[0] = 0x3ULL;
+    for (int b = 1; b < WFC_MASK_U64S; ++b) c->mask[b] = 0;
+    float both = wfc_cell_entropy(w, c);
+    assert(both > 0.99f && both < 1.01f);
+    c->mask[0] = 0x1ULL;
+    float one = wfc_cell_entropy(w, c);
+    assert(one > -1e-6f && one < 1e-6f);
+    wfc_world_destroy(w);
+}
+
+/* Pattern 2 is legal for the right cell only while the left cell can still
+ * be 2. Removing 2 from the left must remove it from the right before either
+ * cell is observed. Collapsed-only propagation does not do that. */
+TEST(ac3_partial_domain) {
+    wfc_config_t cfg = {2, 1, 1, 1, 0, 0, 0, 0, 1.0f, 1.0f};
+    wfc_world_t* w = wfc_world_create(&cfg);
+    wfc_pattern_def_t ps[3] = {
+        {0, 0, 1.0f, 0, 0, {0}},
+        {1, 0, 1.0f, 0, 0, {0}},
+        {2, 0, 1.0f, 0, 0, {0}}
+    };
+    for (int i = 0; i < 3; i++) wfc_add_pattern(w, &ps[i]);
+    /* add_rule writes the opposite direction. A second call on W would
+     * store "0 allows 2 to the east", which is the reverse adjacency.
+     * Pattern 2 may sit beside 0 or 1; 0 and 1 may not sit beside 2. */
+    const wfc_dir_t axes[2] = { WFC_DIR_N, WFC_DIR_E };
+    for (int a = 0; a < 2; a++) {
+        wfc_add_rule(w, 0, 0, axes[a]);
+        wfc_add_rule(w, 1, 1, axes[a]);
+        wfc_add_rule(w, 2, 0, axes[a]);
+        wfc_add_rule(w, 2, 1, axes[a]);
+        wfc_add_rule(w, 2, 2, axes[a]);
+    }
+    uint32_t left = wfc_idx(w, 0, 0, 0);
+    w->cells[left].mask[0] &= ~(1ULL << 2);
+    assert(wfc_solver_prepare(w) == WFC_OK);
+    uint32_t right = wfc_idx(w, 1, 0, 0);
+    assert((w->cells[right].mask[0] & (1ULL << 2)) == 0);
+    assert(wfc_collapse(w) == WFC_OK);
+    assert(wfc_get_cell_pattern(w, 0, 0, 0) != 2);
+    assert(wfc_get_cell_pattern(w, 1, 0, 0) != 2);
+    wfc_world_destroy(w);
+}
+
+/* East of the last column is the first column, including when nx is not a
+ * power of two (the old index stepped into the padding instead). */
+TEST(seamless_torus) {
+    wfc_config_t cfg = {6, 6, 1, 7, 0, 0, 0, 1, 1.0f, 1.0f};
+    wfc_world_t* w = wfc_world_create(&cfg);
+    wfc_pattern_def_t p0 = {0, 0, 1.0f, 0, 0, {0}};
+    wfc_pattern_def_t p1 = {1, 0, 1.0f, 0, 0, {0}};
+    wfc_add_pattern(w, &p0);
+    wfc_add_pattern(w, &p1);
+    for (int d = 0; d < 4; d++) {
+        wfc_add_rule(w, 0, 1, (wfc_dir_t)d);
+        wfc_add_rule(w, 1, 0, (wfc_dir_t)d);
+    }
+    assert(wfc_collapse(w) == WFC_OK);
+    for (uint32_t y = 0; y < 6; y++) {
+        for (uint32_t x = 0; x < 6; x++) {
+            uint16_t a = wfc_get_cell_pattern(w, x, y, 0);
+            uint16_t e = wfc_get_cell_pattern(w, (x + 1) % 6, y, 0);
+            uint16_t s = wfc_get_cell_pattern(w, x, (y + 1) % 6, 0);
+            assert(a != e);
+            assert(a != s);
+        }
+    }
+    wfc_world_destroy(w);
+}
+
 int main(void) {
     printf("========================================\n");
     printf("WFC Engine C Test Suite\n");
@@ -708,11 +792,14 @@ int main(void) {
     RUN(learn_from_sample);
     RUN(contradiction_callback);
     RUN(seamless_mode);
+    RUN(seamless_torus);
     RUN(step_by_step);
     RUN(class_max_limit);
 
     /* Primitives */
     RUN(bitset_ops);
+    RUN(shannon_entropy);
+    RUN(ac3_partial_domain);
     RUN(rng_distribution);
     RUN(mask_eq_copy);
 
