@@ -163,7 +163,7 @@ if(ENTROPIC_ENABLE_SUSPENDERS)
     FetchContent_Declare(
         memento
         GIT_REPOSITORY https://github.com/StraylightRunMOO/memento.git
-        GIT_TAG        v3.0.0
+        GIT_TAG        v3.0.3
         GIT_SHALLOW    TRUE
     )
     FetchContent_Populate(memento)
@@ -172,7 +172,7 @@ if(ENTROPIC_ENABLE_SUSPENDERS)
     FetchContent_Declare(
         suspenders
         GIT_REPOSITORY https://github.com/StraylightRunMOO/suspenders.h.git
-        GIT_TAG        master
+        GIT_TAG        v1.2.1
         GIT_SHALLOW    TRUE
     )
     FetchContent_Populate(suspenders)

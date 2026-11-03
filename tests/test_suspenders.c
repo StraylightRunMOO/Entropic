@@ -209,6 +209,29 @@ static void test_multiple_fields(void)
     printf(" PASS\n");
 }
 
+static void test_overlap_restart(void)
+{
+    printf("  overlap and restart...");
+    wfc_world_t* a = make_world(32, 32, 11);
+    wfc_world_t* b = make_world(32, 32, 12);
+    assert(wfc_parallel_init(a, 2) == WFC_OK);
+    assert(wfc_parallel_init(b, 4) == WFC_OK);
+    /* The first live init fixes the worker count. */
+    assert(b->susp_num_workers == 2);
+    wfc_parallel_shutdown(a);
+    assert(b->susp_initialized == 1);
+    assert(wfc_set_gumbel_field(b, 0.5, 1) == WFC_OK);
+    wfc_world_destroy(a);
+    wfc_world_destroy(b);
+
+    wfc_world_t* c = make_world(32, 32, 13);
+    assert(wfc_parallel_init(c, 1) == WFC_OK);
+    assert(c->susp_num_workers == 1);
+    assert(wfc_set_gumbel_field(c, 0.5, 2) == WFC_OK);
+    wfc_world_destroy(c);
+    printf(" PASS\n");
+}
+
 static void test_small_grid_serial_fallback(void)
 {
     printf("  small grid (serial fallback)...");
@@ -232,6 +255,7 @@ int main(void)
 
     test_lifecycle();
     test_double_init();
+    test_overlap_restart();
     test_gumbel_parallel();
     test_matern_parallel();
     test_collapse_with_parallel();

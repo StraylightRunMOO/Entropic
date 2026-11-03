@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The shared suspenders runtime stops when the last parallel world shuts down. CMake pins Memento v3.0.3 and suspenders v1.2.1.
 - Observe uses Shannon entropy of the masked weights (`log2 Z − Σ w log2 w / Z`). A singleton is 0. Stale heap keys are recomputed and pushed back when they are no longer the minimum.
 - Propagation is AC-3: a neighbor keeps the OR of `compat` over every pattern still alive, run to a fixpoint before the first observe. Seamless wraps on the logical rectangle. The queue ring is twice the cell count so a full frontier does not look empty.
 - Pattern choice samples that posterior. Hierarchy multiplies by a Gaussian likelihood on the signature. The cascade observes the upsampled coarse signature, blended toward the projected target by `2^(-shift)` (1 at the finest level). With no target the root solve is unbiased and finer levels observe the upsample. The copula multiplies by the Gaussian copula density.

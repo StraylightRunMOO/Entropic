@@ -478,7 +478,10 @@ wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w);
 void      wfc_hierarchy_destroy(wfc_world_t* w);
 #endif
 
-/* Coroutine parallelism. Call wfc_parallel_init before spectral/hierarchy operations. */
+/* Coroutine parallelism. Call before spectral or hierarchy work that should
+ * use the parallel DWT. Worlds share one runtime; the worker count is fixed
+ * by the first init (0 means 4). The last shutdown, including the one from
+ * wfc_world_destroy, stops that runtime. */
 #if defined(WFC_ENABLE_SUSPENDERS)
 wfc_err_t wfc_parallel_init(wfc_world_t* w, unsigned num_workers);
 void      wfc_parallel_shutdown(wfc_world_t* w);
@@ -2869,6 +2872,10 @@ static inline void wfc_par_sync_wait(wfc_par_sync_t* s)
 {
     while (WFC_ATOMIC_LOAD(&s->remaining, acquire) > 0)
         sched_yield();
+    /* Spawn allocated from this thread's memento heap. Park it once the
+     * tasks have finished so a later runtime shutdown, which frees every
+     * heap, does not leave the TLS pointer dangling. */
+    memento_heap_park();
 }
 
 /* --- Task descriptors --- */
@@ -3064,23 +3071,24 @@ static inline void wfc_fill_noise_par(float* buf, uint32_t n, uint64_t noise_see
     WFC_FREE(tasks);
 }
 
-/* --- Process-level suspenders singleton ---
+/* --- Process-level suspenders runtime ---
  *
- * The suspenders runtime (init/run/shutdown) must execute on the same
- * thread, and memento.h's per-CPU heap cache is not cleared across
- * shutdown/reinit cycles, causing UAF. We avoid this by starting the
- * runtime once and never tearing it down — the keepalive coroutine
- * keeps suspenders_run blocking indefinitely. Worker threads stay
- * alive for the process lifetime; per-world resources (scratch buffers)
- * are allocated/freed normally.
+ * init, run, and shutdown run on one thread. suspenders_run returns as
+ * soon as nothing is parked, so one coroutine stays suspended for the
+ * life of the runtime and the foreign threads can submit DWT work.
+ * Worlds share that runtime (the first init picks the worker count).
+ * The last wfc_parallel_shutdown calls suspenders_request_stop and joins.
+ * The run thread then calls suspenders_shutdown, which reaps the parked
+ * coroutine. Memento v3.0.3 drops its per-CPU heap slots on that
+ * shutdown, so the next init is a clean start.
  */
 
+static pthread_mutex_t wfc_susp_mu = PTHREAD_MUTEX_INITIALIZER;
+static int             wfc_susp_refs = 0;
 #ifdef __cplusplus
-static wfc_atomic_int_t  wfc_susp_up{0};
 static wfc_atomic_int_t  wfc_susp_ready{0};
 static wfc_atomic_int_t  wfc_susp_init_err{0};
 #else
-static wfc_atomic_int_t  wfc_susp_up       = 0;
 static wfc_atomic_int_t  wfc_susp_ready    = 0;
 static wfc_atomic_int_t  wfc_susp_init_err = 0;
 #endif
@@ -3091,10 +3099,9 @@ typedef struct {
     unsigned num_workers;
 } wfc_par_boot_t;
 
-static void wfc_par_keepalive_fn(void* arg)
+static void wfc_par_hold_fn(void* arg)
 {
     (void)arg;
-    /* Block forever — keeps suspenders_run from returning. */
     for (;;) suspenders_suspend();
 }
 
@@ -3109,23 +3116,23 @@ static void* wfc_par_run_thread_fn(void* arg)
         return NULL;
     }
 
-    suspenders_cr_t *ka = suspenders_go(wfc_par_keepalive_fn, NULL);
-    if (!ka) {
+    if (!suspenders_go(wfc_par_hold_fn, NULL)) {
         suspenders_shutdown();
         WFC_ATOMIC_STORE(&wfc_susp_init_err, 1, release);
         WFC_ATOMIC_STORE(&wfc_susp_ready, 1, release);
         return NULL;
     }
-    (void)ka;
 
     WFC_ATOMIC_STORE(&wfc_susp_init_err, 0, release);
     WFC_ATOMIC_STORE(&wfc_susp_ready, 1, release);
 
     suspenders_run();
+    suspenders_shutdown();
     return NULL;
 }
 
-static int wfc_susp_singleton_start(unsigned num_workers)
+/* Caller holds wfc_susp_mu. */
+static int wfc_susp_runtime_start(unsigned num_workers)
 {
     static wfc_par_boot_t boot;
     boot.num_workers = num_workers;
@@ -3147,28 +3154,39 @@ static int wfc_susp_singleton_start(unsigned num_workers)
     return 0;
 }
 
+/* Caller holds wfc_susp_mu. Joining here keeps the next init from
+ * starting until this runtime has released Memento. Park first: this
+ * thread may still own a heap from an earlier spawn. */
+static void wfc_susp_runtime_stop(void)
+{
+    memento_heap_park();
+    suspenders_request_stop();
+    pthread_join(wfc_susp_thread, NULL);
+}
+
 wfc_err_t wfc_parallel_init(wfc_world_t* w, unsigned num_workers)
 {
     if (!w) return WFC_EINVAL;
     if (w->susp_initialized) return WFC_OK;
     if (num_workers == 0) num_workers = 4;
 
-    int was_up = WFC_ATOMIC_EXCHANGE(&wfc_susp_up, 1, acq_rel);
-    if (!was_up) {
-        if (wfc_susp_singleton_start(num_workers) != 0) {
-            WFC_ATOMIC_STORE(&wfc_susp_up, 0, release);
+    size_t scratch_sz = 4 * (size_t)w->nx_p2 * w->ny_p2 * sizeof(float);
+    float* scratch = (float*)WFC_MALLOC(scratch_sz);
+    if (!scratch) return WFC_ENOMEM;
+
+    pthread_mutex_lock(&wfc_susp_mu);
+    if (wfc_susp_refs == 0) {
+        if (wfc_susp_runtime_start(num_workers) != 0) {
+            pthread_mutex_unlock(&wfc_susp_mu);
+            WFC_FREE(scratch);
             return WFC_ENOMEM;
         }
     }
-
+    wfc_susp_refs++;
     w->susp_num_workers = wfc_susp_nworkers;
+    pthread_mutex_unlock(&wfc_susp_mu);
 
-    size_t scratch_sz = 4 * (size_t)w->nx_p2 * w->ny_p2 * sizeof(float);
-    w->faf_par_scratch = (float*)WFC_MALLOC(scratch_sz);
-    if (!w->faf_par_scratch) {
-        return WFC_ENOMEM;
-    }
-
+    w->faf_par_scratch = scratch;
     w->susp_initialized = 1;
     return WFC_OK;
 }
@@ -3180,7 +3198,11 @@ void wfc_parallel_shutdown(wfc_world_t* w)
     WFC_FREE(w->faf_par_scratch);
     w->faf_par_scratch = NULL;
     w->susp_num_workers = 0;
-    /* Runtime stays alive — no teardown. */
+
+    pthread_mutex_lock(&wfc_susp_mu);
+    if (wfc_susp_refs > 0) wfc_susp_refs--;
+    if (wfc_susp_refs == 0) wfc_susp_runtime_stop();
+    pthread_mutex_unlock(&wfc_susp_mu);
 }
 
 #endif /* WFC_ENABLE_SUSPENDERS */
