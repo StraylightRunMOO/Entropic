@@ -271,13 +271,21 @@ public:
     void hierarchy_set_wavelet(int family, uint32_t dwt_levels) {
         check();
         wfc_err_t err = wfc_hierarchy_set_wavelet(world_, family, dwt_levels);
+        if (err == WFC_EUNINIT) throw Uninitialized("Hierarchy not initialised");
+        if (err == WFC_EINVAL) throw InvalidArgument("Invalid wavelet family");
         if (err != WFC_OK) throw Error("Failed to set wavelet");
     }
 
     void hierarchy_set_target(const float* target, uint32_t count) {
         check();
         wfc_err_t err = wfc_hierarchy_set_target(world_, target, count);
+        if (err == WFC_EINVAL) throw InvalidArgument("Invalid hierarchy target");
+        if (err == WFC_ENOMEM) throw OutOfMemory("Failed to allocate hierarchy target");
         if (err != WFC_OK) throw Error("Failed to set target");
+    }
+
+    void hierarchy_set_target(const std::vector<float>& target) {
+        hierarchy_set_target(target.data(), static_cast<uint32_t>(target.size()));
     }
 
     void hierarchy_collapse() {

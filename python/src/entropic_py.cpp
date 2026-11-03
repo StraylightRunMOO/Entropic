@@ -124,6 +124,11 @@ NB_MODULE(_entropic, m) {
         .def("hierarchy_init", &World::hierarchy_init, "nlevels"_a)
         .def("hierarchy_set_wavelet", &World::hierarchy_set_wavelet,
              "family"_a, "dwt_levels"_a)
+        .def("hierarchy_set_target", [](World& w, nb::ndarray<float, nb::c_contig> arr) {
+            size_t n = 1;
+            for (size_t i = 0; i < arr.ndim(); ++i) n *= arr.shape(i);
+            w.hierarchy_set_target(arr.data(), static_cast<uint32_t>(n));
+        }, "target"_a)
         .def("hierarchy_collapse", &World::hierarchy_collapse,
              nb::call_guard<nb::gil_scoped_release>())
 #endif
@@ -131,18 +136,19 @@ NB_MODULE(_entropic, m) {
         .def("parallel_init", &World::parallel_init, "num_workers"_a = 0)
         .def("parallel_shutdown", &World::parallel_shutdown)
 #endif
-        .def("set_contradiction_callback", [](World& w, nb::object cb) {
+        .def("set_contradiction_callback", [](World& w, nb::handle cb) {
             if (cb.is_none()) {
                 w.set_contradiction_callback(nullptr);
             } else {
+                nb::object obj = nb::borrow<nb::object>(cb);
                 w.set_contradiction_callback(
-                    [cb](uint32_t x, uint32_t y, uint32_t z) {
+                    [obj](uint32_t x, uint32_t y, uint32_t z) {
                         nb::gil_scoped_acquire guard;
-                        cb(x, y, z);
+                        obj(x, y, z);
                     }
                 );
             }
-        }, "callback"_a)
+        }, "callback"_a.none())
         .def("collapse", &World::collapse,
              nb::call_guard<nb::gil_scoped_release>())
         .def("step_init", &World::step_init)

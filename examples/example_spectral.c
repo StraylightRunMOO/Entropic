@@ -1,11 +1,11 @@
-/* example_spectral.c — Spectral field WFC (requires FFTW) */
+/* example_spectral.c — Spectral field WFC (requires FastAndFourier) */
 #define WFC_IMPLEMENTATION
 #include "entropic/wfc.h"
 #include <stdio.h>
 
 int main(void) {
     printf("=== WFC Spectral Field Example ===\n");
-    printf("(Requires FFTW support compiled in)\n\n");
+    printf("(Requires FastAndFourier support compiled in)\n\n");
 
     wfc_config_t cfg = {
         .nx = 32, .ny = 32, .nz = 1,
@@ -46,7 +46,30 @@ int main(void) {
     }
 
     /* Print */
-    printf("\nResult (spectral bias creates clustering):\n");
+    printf("\nResult (fBm H=0.7):\n");
+    for (uint32_t y = 0; y < w->ny; y++) {
+        for (uint32_t x = 0; x < w->nx; x++) {
+            printf("%c", wfc_get_cell_pattern(w, x, y, 0) == 0 ? '#' : '.');
+        }
+        printf("\n");
+    }
+
+    /* Second pass: Matérn prior on a reset world. */
+    printf("\nResetting and applying Matérn field (kappa=1.0, nu=1.5)...\n");
+    wfc_world_reset(w);
+    err = wfc_set_matern_field(w, 1.0, 1.5, 99);
+    if (err != WFC_OK) {
+        printf("Matérn field generation failed: %d\n", err);
+        wfc_world_destroy(w);
+        return 1;
+    }
+    err = wfc_collapse(w);
+    if (err != WFC_OK) {
+        printf("Matérn collapse failed: %d\n", err);
+        wfc_world_destroy(w);
+        return 1;
+    }
+    printf("\nResult (Matérn):\n");
     for (uint32_t y = 0; y < w->ny; y++) {
         for (uint32_t x = 0; x < w->nx; x++) {
             printf("%c", wfc_get_cell_pattern(w, x, y, 0) == 0 ? '#' : '.');

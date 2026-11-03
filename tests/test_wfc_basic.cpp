@@ -129,6 +129,34 @@ TEST(WorldTest, GridToString) {
     EXPECT_FALSE(s.empty());
 }
 
+#ifdef WFC_ENABLE_HIERARCHY
+TEST(WorldTest, HierarchyCollapse) {
+    Config cfg{.nx = 16, .ny = 16, .seed = 42, .enable_spectral = true};
+    World w(cfg);
+    w.add_pattern(Pattern(0, 0, 5.0f));
+    w.add_pattern(Pattern(1, 1, 3.0f));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    w.hierarchy_init(2);
+    std::vector<float> target(w.num_cells(), 1.0f);
+    w.hierarchy_set_target(target);
+    w.hierarchy_collapse();
+    auto grid = w.export_grid();
+    for (auto p : grid)
+        EXPECT_TRUE(p == 0 || p == 1);
+}
+
+TEST(WorldTest, HierarchyInvalidNlevels) {
+    World w({.nx = 16, .ny = 16, .seed = 42, .enable_spectral = true});
+    EXPECT_THROW(w.hierarchy_init(1), InvalidArgument);
+    EXPECT_THROW(w.hierarchy_init(9), InvalidArgument);
+}
+#endif
+
 TEST(ConfigTest, Defaults) {
     Config cfg;
     EXPECT_EQ(cfg.nx, 64);
@@ -157,6 +185,54 @@ TEST(DirTest, Opposite) {
     EXPECT_EQ(opposite(Dir::U), Dir::D);
     EXPECT_EQ(opposite(Dir::D), Dir::U);
 }
+
+TEST(WorldTest, SymmetricRuleAndPatternDef) {
+    World w({.nx = 4, .ny = 4, .seed = 1});
+    w.add_pattern(Pattern(0, 0));
+    w.add_pattern(Pattern(1, 0));
+    w.add_symmetric_rule(0, 1, Dir::N);
+    ASSERT_NE(w.get_pattern_def(0), nullptr);
+    EXPECT_EQ(w.get_pattern_def(0)->id, 0);
+}
+
+TEST(WorldTest, MoveLeavesUninitialized) {
+    World w1({.nx = 2, .ny = 2, .seed = 1});
+    World w2(std::move(w1));
+    EXPECT_THROW((void)w1.nx(), Uninitialized);
+}
+
+TEST(WorldTest, ContradictionThrows) {
+    World w({.nx = 2, .ny = 2, .seed = 1});
+    w.add_pattern(Pattern(0, 0));
+    EXPECT_THROW(w.collapse(), Contradiction);
+}
+
+TEST(WorldTest, ThreeD) {
+    World w({.nx = 2, .ny = 2, .nz = 2, .seed = 2});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W, Dir::U, Dir::D})
+        w.add_rule(0, 0, d);
+    w.collapse();
+    EXPECT_TRUE(w.is_3d());
+    EXPECT_EQ(w.export_grid().size(), 8u);
+}
+
+#ifdef WFC_USE_FAF
+TEST(WorldTest, GumbelField) {
+    Config cfg{.nx = 8, .ny = 8, .seed = 3, .enable_spectral = true};
+    World w(cfg);
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W})
+        w.add_rule(0, 0, d);
+    w.set_gumbel_field(0.5, 9);
+    w.collapse();
+}
+
+TEST(WorldTest, SpectralRequiresFlag) {
+    World w({.nx = 4, .ny = 4, .seed = 1});
+    EXPECT_THROW(w.set_matern_field(1.0, 1.0, 1), Uninitialized);
+}
+#endif
 
 TEST(WorldTest, LearnFromSample) {
     World w({.nx = 4, .ny = 4, .seed = 42});

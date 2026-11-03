@@ -21,6 +21,7 @@ FetchContent_MakeAvailable(nanobind)
 
 # Optional FastAndFourier for spectral/wavelet features
 option(ENTROPIC_USE_FAF "Enable FastAndFourier wavelet backend" OFF)
+option(ENTROPIC_ENABLE_HIERARCHY "Enable residual multiscale hierarchy (requires FAF)" OFF)
 
 # Build the extension module
 nanobind_add_module(_entropic src/entropic_py.cpp)
@@ -42,12 +43,16 @@ target_compile_definitions(_entropic PRIVATE
     WFC_ENABLE_BACKTRACK
 )
 
+if(ENTROPIC_ENABLE_HIERARCHY AND NOT ENTROPIC_USE_FAF)
+    message(FATAL_ERROR "ENTROPIC_ENABLE_HIERARCHY requires ENTROPIC_USE_FAF")
+endif()
+
 if(ENTROPIC_USE_FAF)
     FetchContent_Declare(
         fastandfourier
         GIT_REPOSITORY https://github.com/NotoriousLOB/FastAndFourier.git
-        GIT_TAG        master
-        GIT_SHALLOW    TRUE
+        GIT_TAG        f53137674929b86b8d50aef949a926920248c50e
+        GIT_SHALLOW    FALSE
     )
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -61,6 +66,9 @@ if(ENTROPIC_USE_FAF)
         ${fastandfourier_SOURCE_DIR}/src)
     target_compile_definitions(_entropic PRIVATE WFC_USE_FAF)
     target_link_libraries(_entropic PRIVATE fastandfourier)
+    if(ENTROPIC_ENABLE_HIERARCHY)
+        target_compile_definitions(_entropic PRIVATE WFC_ENABLE_HIERARCHY)
+    endif()
 endif()
 
 # Install into the Python package directory

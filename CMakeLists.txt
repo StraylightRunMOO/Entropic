@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(entropic VERSION 1.0.0 LANGUAGES C CXX)
+project(entropic VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -21,6 +21,8 @@ option(ENTROPIC_ENABLE_SUSPENDERS  "Enable suspenders.h coroutine parallelism (r
 option(ENTROPIC_ENABLE_COPULA     "Enable Gaussian copula entropy biasing" ON)
 option(ENTROPIC_ENABLE_BACKTRACK  "Enable delta-trail backtracking" ON)
 option(ENTROPIC_BUILD_PYTHON      "Build Python bindings (requires nanobind)" OFF)
+option(ENTROPIC_ENABLE_FUZZ       "Build fuzz targets (libFuzzer + standalone)" OFF)
+option(ENTROPIC_ENABLE_COVERAGE   "Instrument tests for llvm-cov / gcov" OFF)
 
 # ---------------------------------------------------------------------------
 # Core library (interface header-only)
@@ -92,8 +94,8 @@ if(ENTROPIC_USE_FAF)
     FetchContent_Declare(
         fastandfourier
         GIT_REPOSITORY https://github.com/NotoriousLOB/FastAndFourier.git
-        GIT_TAG        master
-        GIT_SHALLOW    TRUE
+        GIT_TAG        f53137674929b86b8d50aef949a926920248c50e  # pin for v1.1.0
+        GIT_SHALLOW    FALSE
     )
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -115,7 +117,11 @@ if(ENTROPIC_USE_FAF)
         $<BUILD_INTERFACE:${fastandfourier_SOURCE_DIR}/include>)
     target_include_directories(wfcpp INTERFACE
         $<BUILD_INTERFACE:${fastandfourier_SOURCE_DIR}/include>)
-    message(STATUS "FastAndFourier enabled (wavelet backend)")
+    if(ENTROPIC_ENABLE_SANITIZERS AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_compile_options(fastandfourier PRIVATE -fsanitize=address,undefined)
+        target_link_options(fastandfourier PUBLIC -fsanitize=address,undefined)
+    endif()
+    message(STATUS "FastAndFourier enabled (wavelet backend; JIT uses cc at runtime, VM fallback otherwise)")
 endif()
 
 if(ENTROPIC_ENABLE_HIERARCHY)
@@ -198,40 +204,104 @@ if(ENTROPIC_BUILD_TESTS)
 endif()
 
 # ---------------------------------------------------------------------------
+# Coverage helper
+# ---------------------------------------------------------------------------
+function(entropic_apply_coverage tgt)
+    if(NOT ENTROPIC_ENABLE_COVERAGE)
+        return()
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        target_compile_options(${tgt} PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+        target_link_options(${tgt} PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+    elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(${tgt} PRIVATE --coverage)
+        target_link_options(${tgt} PRIVATE --coverage)
+    endif()
+endfunction()
+
+# Keep assert() live in tests even when the rest of the tree is Release.
+function(entropic_test_defaults tgt)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${tgt} PRIVATE -UNDEBUG)
+    elseif(MSVC)
+        target_compile_options(${tgt} PRIVATE /UNDEBUG)
+    endif()
+    entropic_apply_coverage(${tgt})
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Test suite
 # ---------------------------------------------------------------------------
 if(ENTROPIC_BUILD_TESTS)
     add_executable(test_wfc_c tests/test_wfc.c)
     target_link_libraries(test_wfc_c PRIVATE wfc)
     target_link_libraries(test_wfc_c PRIVATE m)
+    entropic_test_defaults(test_wfc_c)
     add_test(NAME wfc_c COMMAND test_wfc_c)
 
     add_executable(test_wfc_gtest tests/test_wfc_basic.cpp)
     target_link_libraries(test_wfc_gtest PRIVATE wfcpp gtest_main)
+    entropic_test_defaults(test_wfc_gtest)
     add_test(NAME wfc_gtest COMMAND test_wfc_gtest)
 
     add_executable(test_wfc_cpp tests/test_wfc_cpp.cpp)
     target_link_libraries(test_wfc_cpp PRIVATE wfcpp)
+    entropic_test_defaults(test_wfc_cpp)
     add_test(NAME wfc_cpp COMMAND test_wfc_cpp)
+
+    add_executable(test_gray_sobol tests/test_gray_sobol.c)
+    target_link_libraries(test_gray_sobol PRIVATE wfc m)
+    entropic_test_defaults(test_gray_sobol)
+    add_test(NAME gray_sobol COMMAND test_gray_sobol)
+
+    add_executable(test_quality tests/test_quality.c)
+    target_link_libraries(test_quality PRIVATE wfc m)
+    entropic_test_defaults(test_quality)
+    add_test(NAME quality COMMAND test_quality)
 
     if(ENTROPIC_USE_FAF)
         add_executable(test_faf_smoke tests/test_faf_dwt.c)
         target_link_libraries(test_faf_smoke PRIVATE fastandfourier m)
         target_include_directories(test_faf_smoke PRIVATE
             ${fastandfourier_SOURCE_DIR}/include)
+        entropic_test_defaults(test_faf_smoke)
         add_test(NAME faf_smoke COMMAND test_faf_smoke)
     endif()
 
     if(ENTROPIC_ENABLE_HIERARCHY)
         add_executable(test_hierarchy tests/test_hierarchy.c)
         target_link_libraries(test_hierarchy PRIVATE wfc m)
+        entropic_test_defaults(test_hierarchy)
         add_test(NAME hierarchy COMMAND test_hierarchy)
     endif()
 
     if(ENTROPIC_ENABLE_SUSPENDERS)
         add_executable(test_suspenders tests/test_suspenders.c)
         target_link_libraries(test_suspenders PRIVATE wfc m)
+        entropic_test_defaults(test_suspenders)
         add_test(NAME suspenders COMMAND test_suspenders)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Fuzz testing
+# ---------------------------------------------------------------------------
+if(ENTROPIC_ENABLE_FUZZ)
+    add_executable(fuzz_wfc_standalone tests/fuzz_wfc.c)
+    target_link_libraries(fuzz_wfc_standalone PRIVATE wfc m)
+    target_compile_definitions(fuzz_wfc_standalone PRIVATE FUZZ_STANDALONE)
+    entropic_test_defaults(fuzz_wfc_standalone)
+    if(ENTROPIC_BUILD_TESTS)
+        add_test(NAME fuzz_standalone COMMAND fuzz_wfc_standalone)
+        set_tests_properties(fuzz_standalone PROPERTIES
+            ENVIRONMENT "ENTROPIC_FUZZ_ITERS=400")
+    endif()
+
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        add_executable(fuzz_wfc tests/fuzz_wfc.c)
+        target_link_libraries(fuzz_wfc PRIVATE wfc m)
+        target_compile_options(fuzz_wfc PRIVATE -fsanitize=fuzzer,address -fno-omit-frame-pointer)
+        target_link_options(fuzz_wfc PRIVATE -fsanitize=fuzzer,address)
     endif()
 endif()
 
@@ -274,9 +344,30 @@ if(ENTROPIC_BUILD_EXAMPLES)
     target_link_libraries(example_kowloon PRIVATE wfc)
     target_link_libraries(example_kowloon PRIVATE m)
 
+    add_executable(example_learn examples/example_learn.c)
+    target_link_libraries(example_learn PRIVATE wfc m)
+
+    add_executable(example_backtrack examples/example_backtrack.c)
+    target_link_libraries(example_backtrack PRIVATE wfc m)
+
+    add_executable(example_seamless examples/example_seamless.c)
+    target_link_libraries(example_seamless PRIVATE wfc m)
+
+    add_executable(example_gray_sobol examples/example_gray_sobol.c)
+    target_link_libraries(example_gray_sobol PRIVATE wfc m)
+
+    add_executable(example_cpp_3d examples/example_cpp_3d.cpp)
+    target_link_libraries(example_cpp_3d PRIVATE wfcpp)
+
+    add_executable(example_cpp_tour examples/example_cpp_tour.cpp)
+    target_link_libraries(example_cpp_tour PRIVATE wfcpp)
+
     if(ENTROPIC_USE_FAF)
         add_executable(example_spectral examples/example_spectral.c)
         target_link_libraries(example_spectral PRIVATE wfc m)
+
+        add_executable(example_cpp_wavelets examples/example_cpp_wavelets.cpp)
+        target_link_libraries(example_cpp_wavelets PRIVATE wfcpp)
     endif()
 
     add_executable(example_copula examples/example_copula.c)
@@ -285,6 +376,11 @@ if(ENTROPIC_BUILD_EXAMPLES)
     if(ENTROPIC_ENABLE_HIERARCHY)
         add_executable(example_hierarchy examples/example_hierarchy.c)
         target_link_libraries(example_hierarchy PRIVATE wfc m)
+    endif()
+
+    if(ENTROPIC_ENABLE_SUSPENDERS)
+        add_executable(example_parallel examples/example_parallel.c)
+        target_link_libraries(example_parallel PRIVATE wfc m)
     endif()
 endif()
 
@@ -329,7 +425,29 @@ if(ENTROPIC_BUILD_PYTHON)
             target_compile_definitions(_entropic PRIVATE SUSPENDERS_FORCE_POLL)
         endif()
     endif()
+    entropic_apply_coverage(_entropic)
     install(TARGETS _entropic LIBRARY DESTINATION lib/python/entropic)
+
+    # Stage package layout for in-tree pytest / python benchmarks
+    set(ENTROPIC_PY_STAGE "${CMAKE_BINARY_DIR}/python")
+    add_custom_command(TARGET _entropic POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${ENTROPIC_PY_STAGE}/entropic"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/python/entropic/__init__.py"
+            "${ENTROPIC_PY_STAGE}/entropic/__init__.py"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:_entropic>"
+            "${ENTROPIC_PY_STAGE}/entropic/$<TARGET_FILE_NAME:_entropic>"
+        COMMENT "Staging Python package under ${ENTROPIC_PY_STAGE}"
+    )
+    if(ENTROPIC_BUILD_TESTS)
+        add_test(NAME python_pytest
+            COMMAND ${Python_EXECUTABLE} -m pytest
+                "${CMAKE_CURRENT_SOURCE_DIR}/python/tests" -q
+            WORKING_DIRECTORY "${ENTROPIC_PY_STAGE}")
+        set_tests_properties(python_pytest PROPERTIES
+            ENVIRONMENT "PYTHONPATH=${ENTROPIC_PY_STAGE}")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

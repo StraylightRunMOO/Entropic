@@ -1,5 +1,8 @@
 # Build artifacts
 build/
+build-coverage/
+*.profraw
+*.profdata
 *.o
 *.a
 *.so

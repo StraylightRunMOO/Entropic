@@ -1,4 +1,5 @@
 /* test_wfc_cpp.cpp — C++ wrapper tests with inline test framework */
+#undef NDEBUG
 #include <entropic/wfcpp.hpp>
 #include <iostream>
 #include <chrono>
@@ -304,6 +305,184 @@ TEST(null_callback) {
     w.collapse();
 }
 
+#ifdef WFC_ENABLE_HIERARCHY
+TEST(hierarchy_collapse) {
+    Config cfg{.nx = 16, .ny = 16, .seed = 42, .enable_spectral = true};
+    World w(cfg);
+    w.add_pattern(Pattern(0, 0, 5.0f));
+    w.add_pattern(Pattern(1, 1, 3.0f));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    w.hierarchy_init(2);
+    w.hierarchy_set_wavelet(FAF_WAVELET_CDF97, 0);
+    std::vector<float> target(w.num_cells());
+    for (size_t i = 0; i < target.size(); ++i) target[i] = (float)i;
+    w.hierarchy_set_target(target);
+    w.hierarchy_collapse();
+    auto grid = w.export_grid();
+    for (auto p : grid) assert(p == 0 || p == 1);
+}
+
+TEST(hierarchy_invalid_nlevels) {
+    World w({.nx = 16, .ny = 16, .seed = 42, .enable_spectral = true});
+    try {
+        w.hierarchy_init(1);
+        assert(false && "should have thrown");
+    } catch (const InvalidArgument&) {}
+    try {
+        w.hierarchy_init(9);
+        assert(false && "should have thrown");
+    } catch (const InvalidArgument&) {}
+}
+#endif
+
+TEST(get_pattern_def_and_symmetric) {
+    World w({.nx = 4, .ny = 4, .seed = 1});
+    w.add_pattern(Pattern(0, 0));
+    w.add_pattern(Pattern(1, 0));
+    w.add_symmetric_rule(0, 1, Dir::E);
+    const wfc_pattern_def_t* def = w.get_pattern_def(0);
+    assert(def && def->id == 0);
+    assert(w.num_classes() >= 1);
+    assert(w.c_ptr() != nullptr);
+}
+
+TEST(uninitialized_after_move) {
+    World w1({.nx = 2, .ny = 2, .seed = 1});
+    World w2(std::move(w1));
+    try {
+        (void)w1.nx();
+        assert(false && "should throw");
+    } catch (const Uninitialized&) {}
+    World empty;
+    try {
+        empty.collapse();
+        assert(false && "should throw");
+    } catch (const Uninitialized&) {}
+}
+
+TEST(three_d_export) {
+    World w({.nx = 2, .ny = 2, .nz = 2, .seed = 4});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W, Dir::U, Dir::D})
+        w.add_rule(0, 0, d);
+    w.collapse();
+    auto grid = w.export_grid();
+    assert(grid.size() == 8);
+    assert(w.is_3d());
+    assert(w.get_pattern(0, 0, 1) == 0);
+}
+
+TEST(contradiction_throws) {
+    World w({.nx = 2, .ny = 2, .seed = 1});
+    w.add_pattern(Pattern(0, 0));
+    try {
+        w.collapse();
+        assert(false && "should throw");
+    } catch (const Contradiction& e) {
+        auto [x, y, z] = e.where();
+        (void)x; (void)y; (void)z;
+    }
+}
+
+#if defined(WFC_ENABLE_BACKTRACK)
+TEST(backtrack_enabled) {
+    Config cfg{.nx = 4, .ny = 4, .seed = 13, .enable_backtracking = true};
+    World w(cfg);
+    w.add_pattern(Pattern(0, 0, 1.0f));
+    w.add_pattern(Pattern(1, 0, 1.0f));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(1, 1, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+    }
+    w.collapse();
+    auto grid = w.export_grid();
+    for (auto p : grid) assert(p == 0 || p == 1);
+}
+#endif
+
+#if defined(WFC_ENABLE_COPULA)
+TEST(copula_via_c_ptr) {
+    Config cfg{.nx = 4, .ny = 4, .seed = 2, .enable_copula = true, .copula_weight = 1.0f};
+    World w(cfg);
+    w.add_pattern(Pattern(0, 0));
+    w.add_pattern(Pattern(1, 1));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(1, 1, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+    }
+    wfc_world_t* raw = w.c_ptr();
+    raw->copula_z[0] = 0.0f;
+    raw->copula_z[1] = 0.0f;
+    for (int d = 0; d < 4; d++)
+        raw->copula_rho[d][0][0] = 0.7f;
+    w.collapse();
+}
+#endif
+
+#if defined(WFC_USE_FAF)
+TEST(spectral_fields) {
+    Config cfg{.nx = 8, .ny = 8, .seed = 3, .enable_spectral = true};
+    World w(cfg);
+    w.add_pattern(Pattern(0, 0));
+    w.add_pattern(Pattern(1, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    w.set_gumbel_field(0.6, 11);
+    w.collapse();
+    w.reset();
+    w.set_matern_field(1.0, 1.5, 12);
+    w.collapse();
+}
+
+TEST(spectral_uninitialized) {
+    World w({.nx = 4, .ny = 4, .seed = 1});
+    try {
+        w.set_gumbel_field(0.5, 1);
+        assert(false && "should throw");
+    } catch (const Uninitialized&) {}
+}
+#endif
+
+TEST(invalid_rule_throws) {
+    World w({.nx = 2, .ny = 2, .seed = 1});
+    w.add_pattern(Pattern(0, 0));
+    try {
+        w.add_rule(0, 0, static_cast<Dir>(99));
+        assert(false && "should throw");
+    } catch (const InvalidArgument&) {}
+}
+
+TEST(learn_too_small) {
+    World w({.nx = 2, .ny = 2, .seed = 1});
+    w.add_pattern(Pattern(0, 0));
+    std::vector<uint16_t> tiny = {0};
+    try {
+        w.learn_from_sample(tiny, 2, 2, 1);
+        assert(false && "should throw");
+    } catch (const InvalidArgument&) {}
+}
+
+TEST(cell_oob) {
+    World w({.nx = 2, .ny = 2, .seed = 1});
+    try {
+        (void)w.cell(999);
+        assert(false && "should throw");
+    } catch (const InvalidArgument&) {}
+}
+
 TEST(class_limits) {
     World w({.nx = 8, .ny = 8, .seed = 42});
     w.add_pattern(Pattern(0, 0, 1.0f));
@@ -354,6 +533,27 @@ int main() {
     RUN(pattern_with_layers);
     RUN(config_round_trip);
     RUN(null_callback);
+#ifdef WFC_ENABLE_HIERARCHY
+    RUN(hierarchy_collapse);
+    RUN(hierarchy_invalid_nlevels);
+#endif
+    RUN(get_pattern_def_and_symmetric);
+    RUN(uninitialized_after_move);
+    RUN(three_d_export);
+    RUN(contradiction_throws);
+#if defined(WFC_ENABLE_BACKTRACK)
+    RUN(backtrack_enabled);
+#endif
+#if defined(WFC_ENABLE_COPULA)
+    RUN(copula_via_c_ptr);
+#endif
+#if defined(WFC_USE_FAF)
+    RUN(spectral_fields);
+    RUN(spectral_uninitialized);
+#endif
+    RUN(invalid_rule_throws);
+    RUN(learn_too_small);
+    RUN(cell_oob);
     RUN(class_limits);
 
     std::cout << "\n========================================\n";

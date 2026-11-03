@@ -17,6 +17,7 @@
 #endif
 #include "entropic/wfc.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 static void print_grid(const wfc_world_t* w, uint32_t nx, uint32_t ny)
 {
@@ -59,24 +60,30 @@ int main(void)
                 wfc_add_rule(w, a, b, d);
     }
 
-    /* Set up 3-level hierarchy: 8x8 -> 16x16 -> 32x32 */
-    wfc_err_t err = wfc_hierarchy_init(w, 3);
+    /* init → set_wavelet → set_target → collapse */
+    wfc_err_t err = wfc_hierarchy_init(w, 3);          /* 8×8 → 16×16 → 32×32 */
     if (err != WFC_OK) { fprintf(stderr, "hierarchy_init failed: %d\n", err); return 1; }
 
-    /* Generate a spectral target field for biasing */
+    err = wfc_hierarchy_set_wavelet(w, FAF_WAVELET_CDF97, 0);
+    if (err != WFC_OK) { fprintf(stderr, "set_wavelet failed: %d\n", err); return 1; }
+
     err = wfc_set_gumbel_field(w, 0.7, 12345);
     if (err != WFC_OK) { fprintf(stderr, "set_gumbel_field failed: %d\n", err); return 1; }
 
-    /* Use the spectral field as the hierarchy target */
     err = wfc_hierarchy_set_target(w, w->spectral_field, w->num_cells);
     if (err != WFC_OK) { fprintf(stderr, "set_target failed: %d\n", err); return 1; }
 
-    /* Collapse via hierarchy */
     err = wfc_hierarchy_collapse(w);
     if (err != WFC_OK) { fprintf(stderr, "hierarchy_collapse failed: %d\n", err); return 1; }
 
     printf("Hierarchy collapse result:\n");
     print_grid(w, cfg.nx, cfg.ny);
+
+    uint16_t* grid = (uint16_t*)malloc(cfg.nx * cfg.ny * sizeof(uint16_t));
+    if (grid) {
+        wfc_export_grid(w, grid, cfg.nx * cfg.ny);
+        free(grid);
+    }
 
     /* Print scale info */
     printf("\nScale levels:\n");

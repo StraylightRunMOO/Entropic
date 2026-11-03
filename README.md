@@ -2,7 +2,9 @@
 
 A single-header C11 Wave Function Collapse engine for people who want
 constrained procedural generation at HPC speed. SIMD bitsets, spectral
-priors, Gaussian copula biasing, and a step-by-step API you can visualise.
+priors, Gaussian copula biasing, optional residual multiscale hierarchy
+and wavelet spectral priors (FastAndFourier), and a step-by-step API
+you can visualise.
 
 ```c
 #define WFC_IMPLEMENTATION
@@ -32,7 +34,7 @@ with weighted randomness, propagates constraints via AC-3, and repeats.
 The whole thing runs off a single `uint64_t` PRNG and a pre-allocated
 binary heap — zero heap traffic on the hot path.
 
-Version 1.0.0. MIT, see `LICENSE`.
+Version 1.1.0. MIT, see `LICENSE`.
 
 Part of the [StraylightRunMOO](https://github.com/StraylightRunMOO)
 ecosystem alongside
@@ -51,8 +53,11 @@ ecosystem alongside
 | `include/entropic/gray_codes.h` | Standalone Gray code library (binary reflected, balanced, monotone, Beckett, …) |
 | `include/entropic/sobol.h` | Sobol quasi-random sequences (Joe–Kuo, 10 dimensions) |
 | `python/` | nanobind Python bindings — NumPy arrays out, GIL released during collapse |
-| `examples/` | Seven worked examples covering the full API surface |
-| `benchmarks/` | Microbench suite: 2D/3D grids, constrained, step mode |
+| `examples/` | C and C++ demos covering the solver, wrapper, Gray/Sobol, and gated FAF features |
+| `python/examples/` | Python scripts covering the nanobind API (`hasattr` for optional methods) |
+| `benchmarks/` | Microbench suite: 2D/3D, learned, spectral, copula, backtrack, hierarchy |
+| `python/tests/` | pytest API + generation-quality suite |
+| `python/benchmarks/` | Python collapse/learn/step JSON benches |
 
 ## How it works (the five-minute version)
 
@@ -92,8 +97,29 @@ without touching the constraint rules.
 progressively finer resolutions. Each level creates a temporary world
 at that scale, biased by the residual between a target field and the
 upsampled coarser solution. The finest level copies its result back to
-the main world. Level dimensions are powers of two derived automatically
-from the grid dimensions.
+the main world.
+
+### How the residual hierarchy works
+
+Level sizes are derived by successive right-shifts of the padded
+dimensions (`nx_p2`, `ny_p2`), with a minimum of 4 on each axis.
+`wfc_hierarchy_init` returns `WFC_EINVAL` if `nlevels` is outside
+`[2, 8]` or if the coarsest scale would fall below 4×4. Weights scale
+as `1 / 2^shift`. The residual at level *k* is the difference between
+the target (or, with no target, zero) projected onto that scale by
+box-averaging logical cells, and the 2× upsample of the coarser
+level's collapsed codes. Coupling between levels is only through the
+spectral bias field — there is no direct pattern locking from coarse
+codes yet.
+
+```c
+wfc_hierarchy_init(w, 3);                         /* 8×8 → 16×16 → 32×32 */
+wfc_hierarchy_set_wavelet(w, FAF_WAVELET_CDF97, 0); /* 0 = full DWT depth */
+wfc_hierarchy_set_target(w, field, w->num_cells); /* optional */
+wfc_hierarchy_collapse(w);                        /* writes back to w */
+```
+
+See `examples/example_hierarchy.c` and `python/examples/wavelets.py`.
 
 **Gaussian copula** (`WFC_ENABLE_COPULA`). Class-aware correlation via
 C-vine factorisation with precomputed Z-values. Patterns of the same class
@@ -116,14 +142,16 @@ ordering as the finding.
 
 | Grid | Patterns | Avg time | Throughput |
 |---|---|---|---|
-| 8×8 2D | 2 | 0.05 ms | 1.3 cells/µs |
-| 32×32 2D | 4 | 0.76 ms | 1.3 cells/µs |
-| 64×64 2D | 4 | 3.2 ms | 1.3 cells/µs |
-| 128×128 2D | 4 | 15.0 ms | 1.1 cells/µs |
-| 256×256 2D | 2 | 133 ms | 0.5 cells/µs |
-| 8×8×8 3D | 2 | 0.38 ms | 1.3 cells/µs |
-| 16×16×16 3D | 4 | 3.2 ms | 1.3 cells/µs |
-| 32×32×32 3D | 4 | 41.6 ms | 0.8 cells/µs |
+| 8×8 2D | 2 | 0.06 ms | 1.1 cells/µs |
+| 32×32 2D | 4 | 0.96 ms | 1.1 cells/µs |
+| 64×64 2D | 4 | 4.2 ms | 1.0 cells/µs |
+| 128×128 2D | 4 | 20.5 ms | 0.8 cells/µs |
+| 256×256 2D | 2 | 142 ms | 0.5 cells/µs |
+| 8×8×8 3D | 2 | 0.47 ms | 1.1 cells/µs |
+| 16×16×16 3D | 4 | 4.2 ms | 1.0 cells/µs |
+| 32×32×32 3D | 4 | 48.9 ms | 0.7 cells/µs |
+| 64×64 2D hierarchy (3-level) | 4 | 4.7 ms | 0.9 cells/µs |
+| 128×128 2D hierarchy (3-level) | 4 | 22.3 ms | 0.7 cells/µs |
 
 The 256×256 row is the heap rebuild cost asserting itself — lazy entropy
 updates batch well when most neighbours haven't changed, less well when the
@@ -150,11 +178,12 @@ not build the C++ or gtest suites.
 |---|---|---|
 | `ENTROPIC_BUILD_TESTS` | ON | Three test suites: C assert, Google Test, C++ inline |
 | `ENTROPIC_BUILD_BENCHMARKS` | ON | `bench_wfc` microbench binary |
-| `ENTROPIC_BUILD_EXAMPLES` | ON | All seven example binaries |
+| `ENTROPIC_BUILD_EXAMPLES` | ON | C/C++ example binaries (catalog in `examples/README.md`) |
 | `ENTROPIC_ENABLE_AVX2` | OFF | AVX2 bitset operations (x86_64) |
 | `ENTROPIC_ENABLE_NEON` | OFF | ARM NEON bitset operations (aarch64) |
-| `ENTROPIC_USE_FAF` | OFF | Wavelet spectral backend via FastAndFourier |
+| `ENTROPIC_USE_FAF` | OFF | Wavelet spectral backend via FastAndFourier (FetchContent, pinned commit) |
 | `ENTROPIC_ENABLE_HIERARCHY` | OFF | Residual multiscale hierarchy (requires FAF) |
+| `ENTROPIC_ENABLE_SUSPENDERS` | OFF | Coroutine parallelism for DWT/noise (requires FAF) |
 | `ENTROPIC_ENABLE_COPULA` | ON | Gaussian copula biasing |
 | `ENTROPIC_ENABLE_BACKTRACK` | ON | Delta-trail backtracking |
 | `ENTROPIC_ENABLE_SANITIZERS` | OFF | ASan + UBSan (Debug builds only) |
@@ -180,6 +209,7 @@ python -c "import entropic; print(entropic.World(entropic.Config(nx=8, ny=8)))"
 ```
 
 Or from the top-level CMake: `cmake .. -DENTROPIC_BUILD_PYTHON=ON`.
+Worked scripts live in `python/examples/` (`PYTHONPATH=build/python`).
 
 ## How to call it
 
@@ -236,7 +266,9 @@ The wrapper handles lifecycle (RAII, move, no copy), throws on error
 and provides `CellView` for per-cell inspection, `grid_to_string` for
 debug output, and `idx_to_coords` / `coords_to_idx` for index conversion.
 `wfcpp.hpp` defines `WFC_IMPLEMENTATION` internally — don't define it
-yourself when using the C++ header.
+yourself when using the C++ header. With hierarchy enabled the wrapper
+forwards `hierarchy_init`, `hierarchy_set_wavelet`, `hierarchy_set_target`
+(`std::vector<float>` or pointer + count), and `hierarchy_collapse`.
 
 ### Python
 
@@ -252,8 +284,17 @@ w.collapse()
 grid = w.export_grid()   # numpy uint16 array, shape (nz, ny, nx)
 ```
 
-The GIL is released during `collapse()`. Contradiction callbacks
-re-acquire it.
+With hierarchy enabled (`-DENTROPIC_USE_FAF=ON -DENTROPIC_ENABLE_HIERARCHY=ON`):
+
+```python
+w.hierarchy_init(3)
+w.hierarchy_set_wavelet(3, 0)          # FAF_WAVELET_CDF97, full depth
+w.hierarchy_set_target(field)          # 1-D float32 NumPy array, length num_cells
+w.hierarchy_collapse()
+```
+
+The GIL is released during `collapse()` and `hierarchy_collapse()`.
+Contradiction callbacks re-acquire it.
 
 ## The small print (a.k.a. honest limitations)
 
@@ -274,6 +315,14 @@ re-acquire it.
   `-DENTROPIC_USE_FAF=ON` to enable `wfc_set_gumbel_field` and
   `wfc_set_matern_field`. Without it the solver works fine; you just
   lose the spatial bias. The multiscale hierarchy also requires FAF.
+  FastAndFourier is pulled via FetchContent at a pinned commit. The
+  FAF JIT wants a system C compiler (`cc`) at runtime; if none is
+  available the interpreter VM is used, which is the right fallback
+  for locked-down targets.
+- **Hierarchy coupling is spectral-only.** Coarse pattern IDs bias the
+  finer entropy field; they do not lock finer cells to matching
+  patterns. Hierarchy is 2D (the finest level writes `z = 0` back to
+  the main world).
 - **Copula calibration is manual.** The library provides the machinery
   (`wfc_set_class_limit`, copula weight in config) but not a way to
   estimate correlation parameters from data. Bring your own Z-values, or
@@ -323,12 +372,43 @@ if you need it.
 
 ## Testing
 
-Three test suites: `test_wfc_c` (C assert-based, standalone TU),
-`test_wfc_gtest` (C++ wrapper via Google Test 1.14.0), and `test_wfc_cpp`
-(C++ wrapper, inline assert framework with its own `main`). Each is its
-own binary to avoid ODR violations from multiple `WFC_IMPLEMENTATION`
-definitions. ASan and UBSan available via
-`-DENTROPIC_ENABLE_SANITIZERS=ON` (Debug builds only).
+C/C++ suites, each its own binary so `WFC_IMPLEMENTATION` is defined once:
+
+| Target | What it covers |
+|---|---|
+| `test_wfc_c` | C API, edge paths, copula/backtrack/spectral when enabled |
+| `test_wfc_gtest` | C++ wrapper via Google Test 1.14.0 |
+| `test_wfc_cpp` | C++ wrapper, inline assert framework |
+| `test_gray_sobol` | `gray_codes.h` / `sobol.h` |
+| `test_quality` | Constraint fidelity, learned checkerboard, weight histogram, seed determinism |
+| `test_faf_smoke` | FastAndFourier DWT (`ENTROPIC_USE_FAF`) |
+| `test_hierarchy` | Residual cascade (`ENTROPIC_ENABLE_HIERARCHY`) |
+| `test_suspenders` | Coroutine parallelism (`ENTROPIC_ENABLE_SUSPENDERS`) |
+| `fuzz_wfc_standalone` | Bounded PRNG fuzz (`ENTROPIC_ENABLE_FUZZ`); `fuzz_wfc` is the libFuzzer binary |
+
+Python (with `-DENTROPIC_BUILD_PYTHON=ON`):
+
+```bash
+ctest -R python_pytest
+# or
+PYTHONPATH=build/python python -m pytest python/tests -q
+PYTHONPATH=build/python python python/benchmarks/bench_entropic.py
+```
+
+ASan/UBSan: `-DENTROPIC_ENABLE_SANITIZERS=ON` (Debug only). Coverage
+(clang source-based, fail under 90% lines in `wfc.h`):
+
+```bash
+./scripts/run_coverage.sh
+```
+
+Fuzz with libFuzzer (clang):
+
+```bash
+cmake -B build -DENTROPIC_ENABLE_FUZZ=ON
+cmake --build build --target fuzz_wfc
+./build/fuzz_wfc -max_total_time=30
+```
 
 ## Roadmap
 

@@ -16,6 +16,7 @@
 #endif
 #include "entropic/wfc.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <assert.h>
 
 static wfc_world_t* make_world(uint32_t nx, uint32_t ny, uint32_t seed)
@@ -159,6 +160,92 @@ static void test_with_target(void)
     printf(" PASS\n");
 }
 
+static void test_residual_nonzero(void)
+{
+    printf("  residual non-zero with target...");
+    wfc_world_t* w = make_world(32, 32, 8);
+    wfc_err_t err = wfc_hierarchy_init(w, 3);
+    assert(err == WFC_OK);
+
+    /* Strong spatial ramp so the box-averaged residual cannot vanish. */
+    float* tgt = (float*)malloc(w->num_cells * sizeof(float));
+    assert(tgt);
+    for (uint32_t y = 0; y < w->ny_p2; ++y)
+        for (uint32_t x = 0; x < w->nx_p2; ++x)
+            tgt[y * w->nx_p2 + x] = (float)x + 2.0f * (float)y;
+
+    err = wfc_hierarchy_set_target(w, tgt, w->num_cells);
+    assert(err == WFC_OK);
+    err = wfc_hierarchy_collapse(w);
+    assert(err == WFC_OK);
+
+    int nonzero = 0;
+    for (uint32_t k = 0; k < w->hierarchy->nlevels; ++k) {
+        wfc_scale_t* s = &w->hierarchy->levels[k];
+        for (uint32_t i = 0; i < s->ncells; ++i) {
+            if (s->residual_field[i] != 0.0f) { nonzero = 1; break; }
+        }
+        if (nonzero) break;
+    }
+    assert(nonzero && "expected non-zero residual after targeted collapse");
+
+    free(tgt);
+    wfc_world_destroy(w);
+    printf(" PASS\n");
+}
+
+static void test_finest_writes_back(void)
+{
+    printf("  finest level writes back...");
+    wfc_world_t* w = make_world(32, 32, 9);
+    wfc_err_t err = wfc_hierarchy_init(w, 3);
+    assert(err == WFC_OK);
+
+    err = wfc_hierarchy_collapse(w);
+    assert(err == WFC_OK);
+
+    wfc_scale_t* finest = &w->hierarchy->levels[w->hierarchy->finest_idx];
+    assert(finest->nx == w->nx_p2);
+    assert(finest->ny == w->ny_p2);
+    for (uint32_t y = 0; y < w->ny; ++y) {
+        for (uint32_t x = 0; x < w->nx; ++x) {
+            uint16_t from_world = wfc_get_cell_pattern(w, x, y, 0);
+            uint16_t from_scale = finest->coarse_codes[y * finest->nx + x];
+            assert(from_world == from_scale);
+            assert(from_world == 0 || from_world == 1);
+        }
+    }
+
+    wfc_world_destroy(w);
+    printf(" PASS\n");
+}
+
+static void test_nonsquare_levels(void)
+{
+    printf("  non-square / non-p2 grid...");
+    wfc_world_t* w = make_world(48, 32, 10);
+    wfc_err_t err = wfc_hierarchy_init(w, 3);
+    assert(err == WFC_OK);
+    /* 48×32 pads to 64×32; 3 levels → 16×8, 32×16, 64×32 */
+    assert(w->hierarchy->levels[0].nx == 16);
+    assert(w->hierarchy->levels[0].ny == 8);
+    assert(w->hierarchy->levels[1].nx == 32);
+    assert(w->hierarchy->levels[1].ny == 16);
+    assert(w->hierarchy->levels[2].nx == 64);
+    assert(w->hierarchy->levels[2].ny == 32);
+
+    err = wfc_hierarchy_collapse(w);
+    assert(err == WFC_OK);
+    for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 48; ++x) {
+            uint16_t pat = wfc_get_cell_pattern(w, x, y, 0);
+            assert(pat == 0 || pat == 1);
+        }
+
+    wfc_world_destroy(w);
+    printf(" PASS\n");
+}
+
 static void test_invalid_args(void)
 {
     printf("  invalid args...");
@@ -168,6 +255,8 @@ static void test_invalid_args(void)
     assert(wfc_hierarchy_init(w, 1) == WFC_EINVAL);
     /* nlevels > 8 */
     assert(wfc_hierarchy_init(w, 9) == WFC_EINVAL);
+    /* coarsest scale would be < 4 (16 >> 4 == 1) */
+    assert(wfc_hierarchy_init(w, 5) == WFC_EINVAL);
 
     /* set_wavelet before init */
     assert(wfc_hierarchy_set_wavelet(w, FAF_WAVELET_HAAR, 3) == WFC_EUNINIT);
@@ -186,6 +275,9 @@ int main(void)
     test_three_level_collapse();
     test_set_wavelet();
     test_with_target();
+    test_residual_nonzero();
+    test_finest_writes_back();
+    test_nonsquare_levels();
     test_invalid_args();
 
     printf("\nAll hierarchy tests passed.\n");

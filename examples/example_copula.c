@@ -60,6 +60,28 @@ int main(void) {
         }
     }
 
+    /* learn_from_sample never writes rho. Set class correlation by hand:
+     * same-class neighbours attract, cross-class pairs mildly repel. */
+#ifdef WFC_ENABLE_COPULA
+    w->copula_marginal[0] = 0.4f;
+    w->copula_marginal[1] = 0.4f;
+    w->copula_marginal[2] = 0.2f;
+    w->copula_z[0] = wfc_inv_cdf_normal(w->copula_marginal[0]);
+    w->copula_z[1] = wfc_inv_cdf_normal(w->copula_marginal[1]);
+    w->copula_z[2] = wfc_inv_cdf_normal(w->copula_marginal[2]);
+    for (int d = 0; d < 4; d++) {
+        w->copula_rho[d][0][0] = 0.85f;
+        w->copula_rho[d][1][1] = 0.85f;
+        w->copula_rho[d][2][2] = 0.70f;
+        w->copula_rho[d][0][1] = -0.35f;
+        w->copula_rho[d][1][0] = -0.35f;
+        w->copula_rho[d][0][2] = -0.20f;
+        w->copula_rho[d][2][0] = -0.20f;
+        w->copula_rho[d][1][2] = -0.20f;
+        w->copula_rho[d][2][1] = -0.20f;
+    }
+#endif
+
     printf("Collapsing 16x16 with copula biasing...\n");
     wfc_err_t err = wfc_collapse(w);
     if (err != WFC_OK) {
