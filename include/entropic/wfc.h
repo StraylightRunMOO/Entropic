@@ -103,8 +103,27 @@
 #endif /* WFC_IMPLEMENTATION */
 #include <memento.h>
 #include <suspenders.h>
-#include <stdatomic.h>
 #include <sched.h>
+
+/* C11 atomics do not exist under these names in C++ (std::atomic only),
+ * so route the operations this section uses through one spelling. */
+#ifndef __cplusplus
+#include <stdatomic.h>
+typedef atomic_uint_fast32_t wfc_atomic_u32_t;
+typedef atomic_int           wfc_atomic_int_t;
+#define WFC_ATOMIC_STORE(p, v, mo)     atomic_store_explicit((p), (v), memory_order_##mo)
+#define WFC_ATOMIC_LOAD(p, mo)         atomic_load_explicit((p), memory_order_##mo)
+#define WFC_ATOMIC_FETCH_SUB(p, v, mo) atomic_fetch_sub_explicit((p), (v), memory_order_##mo)
+#define WFC_ATOMIC_EXCHANGE(p, v, mo)  atomic_exchange_explicit((p), (v), memory_order_##mo)
+#else
+#include <atomic>
+typedef std::atomic<uint_fast32_t> wfc_atomic_u32_t;
+typedef std::atomic<int>           wfc_atomic_int_t;
+#define WFC_ATOMIC_STORE(p, v, mo)     (p)->store((v), std::memory_order_##mo)
+#define WFC_ATOMIC_LOAD(p, mo)         (p)->load(std::memory_order_##mo)
+#define WFC_ATOMIC_FETCH_SUB(p, v, mo) (p)->fetch_sub((v), std::memory_order_##mo)
+#define WFC_ATOMIC_EXCHANGE(p, v, mo)  (p)->exchange((v), std::memory_order_##mo)
+#endif
 #ifndef WFC_PAR_MIN_DIM
 #define WFC_PAR_MIN_DIM 32
 #endif
@@ -289,6 +308,8 @@ typedef struct wfc_world {
     float*          faf_workspace;      /* 2 * nx_p2 * ny_p2 interleaved */
     float*          faf_col_buf;        /* 2 * max(nx_p2, ny_p2) temp */
     int             faf_initialized;
+    int             faf_wavelet_family; /* requested family, 0 = default CDF 9/7 */
+    int             faf_live_family;    /* family the live transforms were built with */
 #endif
 
     /* Copula */
@@ -364,7 +385,10 @@ wfc_err_t wfc_set_gumbel_field(wfc_world_t* w, double H, uint64_t noise_seed);
 wfc_err_t wfc_set_matern_field(wfc_world_t* w, double kappa, double nu, uint64_t noise_seed);
 #endif
 
-/* Multiscale hierarchy. Call wfc_hierarchy_init, then optionally set_wavelet/set_target, then collapse. */
+/* Multiscale hierarchy. Call wfc_hierarchy_init, then optionally set_wavelet/set_target, then collapse.
+ * set_wavelet selects the DWT family used by spectral field synthesis and caps the decomposition
+ * depth used by its per-octave scaling. hierarchy_collapse requires spectral fields to be enabled:
+ * the levels couple only through that bias, and without it the call returns WFC_EUNINIT. */
 #if defined(WFC_ENABLE_HIERARCHY)
 wfc_err_t wfc_hierarchy_init(wfc_world_t* w, uint32_t nlevels);
 wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_levels);
@@ -1027,8 +1051,11 @@ static inline wfc_err_t wfc_faf_ensure_transforms(wfc_world_t* w)
     { uint32_t t = nx; while (t > 1) { t >>= 1; levels_row++; } }
     { uint32_t t = ny; while (t > 1) { t >>= 1; levels_col++; } }
 
+    faf_wavelet_family fam = w->faf_wavelet_family
+        ? (faf_wavelet_family)w->faf_wavelet_family : FAF_WAVELET_CDF97;
+
     faf_config rc = faf_config_init(nx);
-    rc.family   = FAF_WAVELET_CDF97;
+    rc.family   = fam;
     rc.levels   = levels_row;
     rc.layout   = FAF_LAYOUT_INTERLEAVED;
     w->faf_row_fwd = faf_create_dwt(&rc);
@@ -1037,7 +1064,7 @@ static inline wfc_err_t wfc_faf_ensure_transforms(wfc_world_t* w)
     if (!w->faf_row_inv) return WFC_ENOMEM;
 
     faf_config cc = faf_config_init(ny);
-    cc.family   = FAF_WAVELET_CDF97;
+    cc.family   = fam;
     cc.levels   = levels_col;
     cc.layout   = FAF_LAYOUT_INTERLEAVED;
     w->faf_col_fwd = faf_create_dwt(&cc);
@@ -1050,6 +1077,7 @@ static inline wfc_err_t wfc_faf_ensure_transforms(wfc_world_t* w)
     if (!w->faf_workspace || !w->faf_col_buf) return WFC_ENOMEM;
 
     w->faf_initialized = 1;
+    w->faf_live_family = fam;
     return WFC_OK;
 }
 
@@ -1210,6 +1238,14 @@ wfc_err_t wfc_set_gumbel_field(wfc_world_t* w, double H, uint64_t noise_seed)
     uint32_t levels_x = 0, levels_y = 0;
     { uint32_t t = nx; while (t > 1) { t >>= 1; levels_x++; } }
     { uint32_t t = ny; while (t > 1) { t >>= 1; levels_y++; } }
+#if defined(WFC_ENABLE_HIERARCHY)
+    /* wfc_hierarchy_set_wavelet may cap the decomposition depth used by
+     * the per-octave scaling below; 0 means use every level. */
+    if (w->hierarchy && w->hierarchy->wavelet_levels > 0) {
+        if (levels_x > w->hierarchy->wavelet_levels) levels_x = w->hierarchy->wavelet_levels;
+        if (levels_y > w->hierarchy->wavelet_levels) levels_y = w->hierarchy->wavelet_levels;
+    }
+#endif
 
     /* Interleaved buffer: 2*n floats (re,im pairs) */
     float* buf = (float*)faf_aligned_alloc(2 * (size_t)n * sizeof(float));
@@ -1263,6 +1299,14 @@ wfc_err_t wfc_set_matern_field(wfc_world_t* w, double kappa, double nu, uint64_t
     uint32_t levels_x = 0, levels_y = 0;
     { uint32_t t = nx; while (t > 1) { t >>= 1; levels_x++; } }
     { uint32_t t = ny; while (t > 1) { t >>= 1; levels_y++; } }
+#if defined(WFC_ENABLE_HIERARCHY)
+    /* wfc_hierarchy_set_wavelet may cap the decomposition depth used by
+     * the per-octave scaling below; 0 means use every level. */
+    if (w->hierarchy && w->hierarchy->wavelet_levels > 0) {
+        if (levels_x > w->hierarchy->wavelet_levels) levels_x = w->hierarchy->wavelet_levels;
+        if (levels_y > w->hierarchy->wavelet_levels) levels_y = w->hierarchy->wavelet_levels;
+    }
+#endif
 
     float* buf = (float*)faf_aligned_alloc(2 * (size_t)n * sizeof(float));
     if (!buf) return WFC_ENOMEM;
@@ -1978,6 +2022,29 @@ wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_lev
     if (!w || !w->hierarchy) return WFC_EUNINIT;
     w->hierarchy->wavelet_family = family;
     w->hierarchy->wavelet_levels = dwt_levels;
+
+    /* The choice is live, not decorative: the family drives the DWT used
+     * by spectral field synthesis, and dwt_levels caps the decomposition
+     * depth in the per-octave scaling. If transforms already exist under
+     * another family, tear them down so the next field generation rebuilds
+     * with this one instead of silently keeping the old wavelet. */
+    if (w->faf_wavelet_family != family) {
+        w->faf_wavelet_family = family;
+        if (w->faf_initialized && w->faf_live_family != family) {
+            if (w->faf_row_fwd) faf_destroy_transform(w->faf_row_fwd);
+            if (w->faf_row_inv) faf_destroy_transform(w->faf_row_inv);
+            if (w->faf_col_fwd) faf_destroy_transform(w->faf_col_fwd);
+            if (w->faf_col_inv) faf_destroy_transform(w->faf_col_inv);
+            w->faf_row_fwd = w->faf_row_inv = NULL;
+            w->faf_col_fwd = w->faf_col_inv = NULL;
+            if (w->faf_workspace) faf_aligned_free(w->faf_workspace);
+            if (w->faf_col_buf) faf_aligned_free(w->faf_col_buf);
+            w->faf_workspace = NULL;
+            w->faf_col_buf = NULL;
+            w->faf_initialized = 0;
+            w->faf_live_family = 0;
+        }
+    }
     return WFC_OK;
 }
 
@@ -2063,6 +2130,12 @@ static void wfc_hierarchy_upsample(const wfc_world_t* parent,
 wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w)
 {
     if (!w || !w->hierarchy) return WFC_EUNINIT;
+
+    /* The levels are coupled only through the spectral bias field. With
+     * spectral disabled there is no coupling to apply, so refuse loudly
+     * instead of silently returning an ordinary flat solve. */
+    if (!w->spectral_enabled) return WFC_EUNINIT;
+
     wfc_hierarchy_t* h = w->hierarchy;
 
     for (uint32_t k = 0; k < h->nlevels; ++k) {
@@ -2173,22 +2246,22 @@ void wfc_hierarchy_destroy(wfc_world_t* w)
 /* --- Atomic barrier for foreign-thread synchronization --- */
 
 typedef struct {
-    atomic_uint_fast32_t remaining;
+    wfc_atomic_u32_t remaining;
 } wfc_par_sync_t;
 
 static inline void wfc_par_sync_init(wfc_par_sync_t* s, uint32_t count)
 {
-    atomic_store_explicit(&s->remaining, count, memory_order_release);
+    WFC_ATOMIC_STORE(&s->remaining, count, release);
 }
 
 static inline void wfc_par_sync_done(wfc_par_sync_t* s)
 {
-    atomic_fetch_sub_explicit(&s->remaining, 1, memory_order_acq_rel);
+    WFC_ATOMIC_FETCH_SUB(&s->remaining, 1, acq_rel);
 }
 
 static inline void wfc_par_sync_wait(wfc_par_sync_t* s)
 {
-    while (atomic_load_explicit(&s->remaining, memory_order_acquire) > 0)
+    while (WFC_ATOMIC_LOAD(&s->remaining, acquire) > 0)
         sched_yield();
 }
 
@@ -2396,10 +2469,10 @@ static inline void wfc_fill_noise_par(float* buf, uint32_t n, uint64_t noise_see
  * are allocated/freed normally.
  */
 
-static atomic_int  wfc_susp_up       = 0;
+static wfc_atomic_int_t  wfc_susp_up       = 0;
 static pthread_t   wfc_susp_thread;
-static atomic_int  wfc_susp_ready;
-static atomic_int  wfc_susp_init_err;
+static wfc_atomic_int_t  wfc_susp_ready;
+static wfc_atomic_int_t  wfc_susp_init_err;
 static unsigned    wfc_susp_nworkers;
 
 typedef struct {
@@ -2419,22 +2492,22 @@ static void* wfc_par_run_thread_fn(void* arg)
 
     int err = suspenders_init(boot->num_workers, 0);
     if (err != SUSPENDERS_OK) {
-        atomic_store_explicit(&wfc_susp_init_err, 1, memory_order_release);
-        atomic_store_explicit(&wfc_susp_ready, 1, memory_order_release);
+        WFC_ATOMIC_STORE(&wfc_susp_init_err, 1, release);
+        WFC_ATOMIC_STORE(&wfc_susp_ready, 1, release);
         return NULL;
     }
 
     suspenders_cr_t *ka = suspenders_go(wfc_par_keepalive_fn, NULL);
     if (!ka) {
         suspenders_shutdown();
-        atomic_store_explicit(&wfc_susp_init_err, 1, memory_order_release);
-        atomic_store_explicit(&wfc_susp_ready, 1, memory_order_release);
+        WFC_ATOMIC_STORE(&wfc_susp_init_err, 1, release);
+        WFC_ATOMIC_STORE(&wfc_susp_ready, 1, release);
         return NULL;
     }
     (void)ka;
 
-    atomic_store_explicit(&wfc_susp_init_err, 0, memory_order_release);
-    atomic_store_explicit(&wfc_susp_ready, 1, memory_order_release);
+    WFC_ATOMIC_STORE(&wfc_susp_init_err, 0, release);
+    WFC_ATOMIC_STORE(&wfc_susp_ready, 1, release);
 
     suspenders_run();
     return NULL;
@@ -2445,16 +2518,16 @@ static int wfc_susp_singleton_start(unsigned num_workers)
     static wfc_par_boot_t boot;
     boot.num_workers = num_workers;
 
-    atomic_store_explicit(&wfc_susp_ready, 0, memory_order_release);
-    atomic_store_explicit(&wfc_susp_init_err, 0, memory_order_release);
+    WFC_ATOMIC_STORE(&wfc_susp_ready, 0, release);
+    WFC_ATOMIC_STORE(&wfc_susp_init_err, 0, release);
 
     if (pthread_create(&wfc_susp_thread, NULL, wfc_par_run_thread_fn, &boot) != 0)
         return -1;
 
-    while (!atomic_load_explicit(&wfc_susp_ready, memory_order_acquire))
+    while (!WFC_ATOMIC_LOAD(&wfc_susp_ready, acquire))
         sched_yield();
 
-    if (atomic_load_explicit(&wfc_susp_init_err, memory_order_acquire)) {
+    if (WFC_ATOMIC_LOAD(&wfc_susp_init_err, acquire)) {
         pthread_join(wfc_susp_thread, NULL);
         return -1;
     }
@@ -2468,10 +2541,10 @@ wfc_err_t wfc_parallel_init(wfc_world_t* w, unsigned num_workers)
     if (w->susp_initialized) return WFC_OK;
     if (num_workers == 0) num_workers = 4;
 
-    int was_up = atomic_exchange_explicit(&wfc_susp_up, 1, memory_order_acq_rel);
+    int was_up = WFC_ATOMIC_EXCHANGE(&wfc_susp_up, 1, acq_rel);
     if (!was_up) {
         if (wfc_susp_singleton_start(num_workers) != 0) {
-            atomic_store_explicit(&wfc_susp_up, 0, memory_order_release);
+            WFC_ATOMIC_STORE(&wfc_susp_up, 0, release);
             return WFC_ENOMEM;
         }
     }
