@@ -290,6 +290,45 @@ static void test_nonsquare_levels(void)
     printf(" PASS\n");
 }
 
+static void test_signature_not_weight(void)
+{
+    printf("  signature not weight...");
+    wfc_world_t* w = make_world(16, 16, 42);
+    /* Equal weights, distinct classes: a weight scalar would alias. */
+    w->patterns[0].weight = 1.0f;
+    w->patterns[1].weight = 1.0f;
+    w->patterns[0].class_id = 0;
+    w->patterns[1].class_id = 1;
+    w->num_classes = 2;
+
+    wfc_err_t err = wfc_hierarchy_init(w, 2);
+    assert(err == WFC_OK);
+    err = wfc_hierarchy_collapse(w);
+    assert(err == WFC_OK);
+
+    wfc_scale_t* coarse = &w->hierarchy->levels[0];
+    wfc_scale_t* fine = &w->hierarchy->levels[1];
+    int saw0 = 0, saw1 = 0;
+    for (uint32_t i = 0; i < coarse->ncells; ++i) {
+        if (coarse->coarse_codes[i] == 0) saw0 = 1;
+        if (coarse->coarse_codes[i] == 1) saw1 = 1;
+    }
+    assert(saw0 && saw1);
+    float v0 = 0.0f, v1 = 0.0f;
+    for (uint32_t cy = 0; cy < coarse->ny; ++cy) {
+        for (uint32_t cx = 0; cx < coarse->nx; ++cx) {
+            uint16_t code = coarse->coarse_codes[cy * coarse->nx + cx];
+            float val = fine->recon_field[(cy * 2) * fine->nx + (cx * 2)];
+            if (code == 0) v0 = val;
+            if (code == 1) v1 = val;
+        }
+    }
+    assert(v0 != v1 && "equal-weight patterns must not alias in the residual");
+
+    wfc_world_destroy(w);
+    printf(" PASS\n");
+}
+
 static void test_invalid_args(void)
 {
     printf("  invalid args...");
@@ -323,6 +362,7 @@ int main(void)
     test_residual_nonzero();
     test_finest_writes_back();
     test_nonsquare_levels();
+    test_signature_not_weight();
     test_invalid_args();
 
     printf("\nAll hierarchy tests passed.\n");

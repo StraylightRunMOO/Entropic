@@ -158,6 +158,7 @@ NB_MODULE(_entropic, m) {
             return w.get_pattern(x, y, z);
         }, "x"_a, "y"_a, "z"_a = 0)
         .def("cell", &World::cell, "index"_a)
+        .def("cell_at", &World::cell_at, "x"_a, "y"_a, "z"_a = 0)
         .def("export_grid", [](const World& w) {
             auto grid = w.export_grid();
             size_t nz = w.nz(), ny = w.ny(), nx = w.nx();

@@ -14,6 +14,8 @@
  *   WFC_ENABLE_COPULA         — enable Gaussian copula entropy biasing
  *   WFC_ENABLE_BACKTRACK      — enable delta-trail backtracking
  *   WFC_MALLOC / WFC_FREE / WFC_REALLOC — allocator overrides
+ *   WFC_ALIGNED_ALLOC / WFC_ALIGNED_FREE — 64-byte cell-array allocator
+ *   WFC_CELL_ALIGN                        — cell alignment (default 64)
  *
  * Usage:
  *   #define WFC_IMPLEMENTATION
@@ -39,6 +41,9 @@
 #ifndef WFC_MAX_CLASSES
 #define WFC_MAX_CLASSES 64
 #endif
+#if (WFC_MAX_CLASSES) > 64
+#error "WFC_MAX_CLASSES must be <= 64 (class_constrained is a uint64_t bitset)"
+#endif
 #ifndef WFC_MAX_LAYERS
 #define WFC_MAX_LAYERS 4
 #endif
@@ -57,6 +62,16 @@
 #ifndef WFC_REALLOC
 #include <stdlib.h>
 #define WFC_REALLOC(p, sz)   realloc(p, sz)
+#endif
+
+#ifndef WFC_CELL_ALIGN
+#define WFC_CELL_ALIGN 64
+#endif
+
+#ifdef __cplusplus
+#define WFC_ALIGNAS(n) alignas(n)
+#else
+#define WFC_ALIGNAS(n) _Alignas(n)
 #endif
 
 /* ============================================================
@@ -141,6 +156,12 @@ typedef std::atomic<int>           wfc_atomic_int_t;
 #define WFC_RESTRICT restrict
 #endif
 
+#ifdef __cplusplus
+#define WFC_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define WFC_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+
 /* ============================================================
  * 4. Constants
  * ============================================================ */
@@ -183,13 +204,11 @@ typedef struct {
     uint16_t layer_types[WFC_MAX_LAYERS]; /* e.g. 1=grass, 2=bush */
 } wfc_pattern_def_t;
 
-/* Grid cell. _Alignas(64) keeps masks on cache lines and prevents false sharing. */
-#ifdef __cplusplus
-struct alignas(64) wfc_cell {
-#else
-_Alignas(64) struct wfc_cell {
-#endif
-    uint64_t mask[WFC_MASK_U64S];       /* valid patterns bitset */
+/* Grid cell. First-member WFC_ALIGNAS(64) sets the type alignment in both
+ * C and C++ (a leading `_Alignas` on the struct tag is ignored by clang).
+ * Allocate arrays with the aligned allocator in wfc_world_create. */
+struct wfc_cell {
+    WFC_ALIGNAS(WFC_CELL_ALIGN) uint64_t mask[WFC_MASK_U64S];
     uint16_t collapsed;                 /* WFC_PATTERN_INVALID if uncollapsed */
     uint16_t reserved;
     float    entropy;                   /* cached Shannon entropy */
@@ -197,6 +216,16 @@ _Alignas(64) struct wfc_cell {
     uint8_t  dirty;                     /* entropy needs recomputation */
 };
 typedef struct wfc_cell wfc_cell_t;
+
+WFC_STATIC_ASSERT(sizeof(wfc_cell_t) % WFC_CELL_ALIGN == 0,
+    "wfc_cell_t size must be a multiple of WFC_CELL_ALIGN for aligned_alloc");
+#ifdef __cplusplus
+WFC_STATIC_ASSERT(alignof(wfc_cell_t) == WFC_CELL_ALIGN,
+    "wfc_cell_t alignment must match WFC_CELL_ALIGN");
+#else
+WFC_STATIC_ASSERT(_Alignof(wfc_cell_t) == WFC_CELL_ALIGN,
+    "wfc_cell_t alignment must match WFC_CELL_ALIGN");
+#endif
 
 /* World configuration */
 typedef struct {
@@ -274,7 +303,7 @@ typedef struct wfc_world {
     uint32_t class_min[WFC_MAX_CLASSES];
     uint32_t class_max[WFC_MAX_CLASSES];
     uint32_t class_placed[WFC_MAX_CLASSES];
-    uint32_t class_constrained;         /* bitmask of classes with min>0 || max<UINT32_MAX */
+    uint64_t class_constrained;         /* bit i set iff class i has a non-default limit */
 
     /* Min-entropy heap (binary min-heap of cell indices) */
     uint32_t* heap;                     /* size num_cells */
@@ -436,9 +465,14 @@ void wfc_world_reset(wfc_world_t* w);
  * ============================================================ */
 #ifdef WFC_IMPLEMENTATION
 
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
 /* --- Utilities --- */
 static inline uint32_t wfc_next_pow2_u32(uint32_t v)
 {
+    if (v <= 1) return 1;
     v--;
     v |= v >> 1;
     v |= v >> 2;
@@ -447,6 +481,36 @@ static inline uint32_t wfc_next_pow2_u32(uint32_t v)
     v |= v >> 16;
     return v + 1;
 }
+
+/* 64-byte (or WFC_CELL_ALIGN) allocation for the cell array.
+ * Override with WFC_ALIGNED_ALLOC / WFC_ALIGNED_FREE if you ship a custom heap. */
+#ifndef WFC_ALIGNED_ALLOC
+static inline void* wfc_alloc_aligned(size_t align, size_t bytes)
+{
+    if (bytes == 0) return NULL;
+    if (align < sizeof(void*)) align = sizeof(void*);
+    size_t n = (bytes + align - 1) / align * align;
+#if defined(_WIN32)
+    return _aligned_malloc(n, align);
+#else
+    void* p = NULL;
+    if (posix_memalign(&p, align, n) != 0) return NULL;
+    return p;
+#endif
+}
+#ifndef WFC_ALIGNED_FREE
+#if defined(_WIN32)
+#define WFC_ALIGNED_FREE(p) _aligned_free(p)
+#else
+#define WFC_ALIGNED_FREE(p) free(p)
+#endif
+#endif
+#else
+#define wfc_alloc_aligned(align, bytes) WFC_ALIGNED_ALLOC((align), (bytes))
+#ifndef WFC_ALIGNED_FREE
+#define WFC_ALIGNED_FREE(p) WFC_FREE(p)
+#endif
+#endif
 
 /* SplitMix64 PRNG. One 64-bit state, excellent quality, no malloc. */
 static inline uint64_t wfc_splitmix64(uint64_t* state)
@@ -860,8 +924,8 @@ static inline void wfc_propagate_from(wfc_world_t* w, uint32_t cell_idx)
 /* --- Class constraint enforcement --- */
 static inline void wfc_enforce_class_limits(wfc_world_t* w)
 {
-    for (int c = 0; c < WFC_MAX_CLASSES && c < 32; ++c) {
-        if (!(w->class_constrained & (1u << c))) continue;
+    for (int c = 0; c < WFC_MAX_CLASSES; ++c) {
+        if (!(w->class_constrained & (1ULL << c))) continue;
         if (w->class_placed[c] >= w->class_max[c]) {
             /* Remove all patterns of class c from every uncollapsed cell. */
             for (uint32_t i = 0; i < w->num_cells; ++i) {
@@ -1224,7 +1288,7 @@ static inline void wfc_faf_scale_matern(float* data, uint32_t nx, uint32_t ny,
     double kk = kappa * kappa;
     uint32_t bx = nx, by = ny;
     for (uint32_t j = 0; j < levels_x && j < levels_y; ++j) {
-        double freq = M_PI / (double)(1u << (j + 1));
+        double freq = M_PI * ldexp(1.0, -(int)(j + 1));
         double base = kk + freq * freq;
         if (base < 1e-12) base = 1e-12;
         float scale = (float)pow(base, -nu);
@@ -1646,7 +1710,8 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
 
     w->num_cells = w->nx_p2 * w->ny_p2 * w->nz_p2;
 
-    w->cells = (wfc_cell_t*)WFC_MALLOC((size_t)w->num_cells * sizeof(wfc_cell_t));
+    w->cells = (wfc_cell_t*)wfc_alloc_aligned(
+        WFC_CELL_ALIGN, (size_t)w->num_cells * sizeof(wfc_cell_t));
     w->heap = (uint32_t*)WFC_MALLOC((size_t)w->num_cells * sizeof(uint32_t));
     w->heap_pos = (uint32_t*)WFC_MALLOC((size_t)w->num_cells * sizeof(uint32_t));
     w->queue = (uint32_t*)WFC_MALLOC((size_t)w->num_cells * sizeof(uint32_t));
@@ -1774,7 +1839,7 @@ void wfc_world_destroy(wfc_world_t* w)
     WFC_FREE(w->trail);
     WFC_FREE(w->trail_gen);
 #endif
-    WFC_FREE(w->cells);
+    WFC_ALIGNED_FREE(w->cells);
     WFC_FREE(w->heap);
     WFC_FREE(w->heap_pos);
     WFC_FREE(w->queue);
@@ -1823,8 +1888,10 @@ wfc_err_t wfc_set_class_limit(wfc_world_t* w, uint16_t class_id, uint32_t min_co
     if (!w || class_id >= WFC_MAX_CLASSES) return WFC_EINVAL;
     w->class_min[class_id] = min_count;
     w->class_max[class_id] = max_count;
-    if (class_id < 32)
-        w->class_constrained |= (1u << class_id);
+    if (min_count > 0 || max_count < 0xFFFFFFFFu)
+        w->class_constrained |= (1ULL << class_id);
+    else
+        w->class_constrained &= ~(1ULL << class_id);
     return WFC_OK;
 }
 
@@ -1988,8 +2055,10 @@ void wfc_world_reset(wfc_world_t* w)
  * Target is stored in the same layout as spectral_field: index = y * nx_p2 + x.
  * Separate x/y ratios handle non-square grids. Only logical (nx, ny) cells
  * contribute, so power-of-two padding does not bias the residual. */
-static void wfc_hierarchy_project_target(const wfc_world_t* w, const float* target,
-                                         uint32_t out_nx, uint32_t out_ny, float* out)
+static void wfc_hierarchy_project_target(const wfc_world_t* WFC_RESTRICT w,
+                                         const float* WFC_RESTRICT target,
+                                         uint32_t out_nx, uint32_t out_ny,
+                                         float* WFC_RESTRICT out)
 {
     uint32_t rx = (out_nx > 0) ? (w->nx_p2 / out_nx) : 1;
     uint32_t ry = (out_ny > 0) ? (w->ny_p2 / out_ny) : 1;
@@ -2144,25 +2213,34 @@ static wfc_world_t* wfc_hierarchy_create_level_world(wfc_world_t* parent, const 
     return lw;
 }
 
+/* Identity embedding of a collapsed pattern for residual coupling.
+ * Class occupies the unit interval in equal bins; pattern id is a unique
+ * sub-quantum so two tiles with equal weight never alias. Invalid codes
+ * map to 0. Weights do not enter. */
+static inline float wfc_pattern_signature(const wfc_world_t* w, uint16_t code)
+{
+    if (!w || code == WFC_PATTERN_INVALID || code >= w->num_patterns)
+        return 0.0f;
+    const wfc_pattern_def_t* p = &w->patterns[code];
+    float nclass = (w->num_classes > 1) ? (float)w->num_classes : 1.0f;
+    float frac = (float)(p->id + 1) * (1.0f / (float)(WFC_MAX_PATTERNS + 1));
+    return ((float)p->class_id + frac) / nclass;
+}
+
 /* Upsample coarse_codes to a float field at 2x resolution.
- * Each coarse cell maps to a 2x2 block; value = pattern_weight / total_weight.
+ * Each coarse cell maps to a 2x2 block filled with its pattern signature.
  * This is a spectral bias, not a hard lock of the finer patterns. */
-static void wfc_hierarchy_upsample(const wfc_world_t* parent,
-                                   const wfc_scale_t* coarse,
-                                   float* fine_field,
+static void wfc_hierarchy_upsample(const wfc_world_t* WFC_RESTRICT parent,
+                                   const wfc_scale_t* WFC_RESTRICT coarse,
+                                   float* WFC_RESTRICT fine_field,
                                    uint32_t fine_nx, uint32_t fine_ny)
 {
-    float total_weight = 0.0f;
-    for (uint32_t i = 0; i < parent->num_patterns; ++i)
-        total_weight += parent->patterns[i].weight;
-    if (total_weight < 1e-12f) total_weight = 1.0f;
+    memset(fine_field, 0, (size_t)fine_nx * (size_t)fine_ny * sizeof(float));
 
     for (uint32_t cy = 0; cy < coarse->ny; ++cy) {
         for (uint32_t cx = 0; cx < coarse->nx; ++cx) {
             uint16_t code = coarse->coarse_codes[cy * coarse->nx + cx];
-            float val = 0.0f;
-            if (code != WFC_PATTERN_INVALID && code < parent->num_patterns)
-                val = parent->patterns[code].weight / total_weight;
+            float val = wfc_pattern_signature(parent, code);
 
             uint32_t fx = cx * 2, fy = cy * 2;
             if (fx < fine_nx && fy < fine_ny) {
@@ -2170,9 +2248,9 @@ static void wfc_hierarchy_upsample(const wfc_world_t* parent,
                 if (fx + 1 < fine_nx)
                     fine_field[fy * fine_nx + fx + 1] = val;
                 if (fy + 1 < fine_ny)
-                    fine_field[(fy+1) * fine_nx + fx] = val;
+                    fine_field[(fy + 1) * fine_nx + fx] = val;
                 if (fx + 1 < fine_nx && fy + 1 < fine_ny)
-                    fine_field[(fy+1) * fine_nx + fx + 1] = val;
+                    fine_field[(fy + 1) * fine_nx + fx + 1] = val;
             }
         }
     }

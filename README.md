@@ -108,9 +108,10 @@ dimensions (`nx_p2`, `ny_p2`), with a minimum of 4 on each axis.
 as `1 / 2^shift`. The residual at level *k* is the difference between
 the target (or, with no target, zero) projected onto that scale by
 box-averaging logical cells, and the 2× upsample of the coarser
-level's collapsed codes. Coupling between levels is only through the
-spectral bias field — there is no direct pattern locking from coarse
-codes yet.
+level's **pattern signatures** (class bin plus a unique pattern-id
+sub-quantum — weights do not enter). Coupling between levels is only
+through the spectral bias field — there is no direct pattern locking
+from coarse codes.
 
 ```c
 wfc_hierarchy_init(w, 3);                         /* 8×8 → 16×16 → 32×32 */

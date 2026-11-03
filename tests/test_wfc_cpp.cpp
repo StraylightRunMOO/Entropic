@@ -4,6 +4,7 @@
 #include <iostream>
 #include <chrono>
 #include <cassert>
+#include <cstdint>
 
 using namespace wfcpp;
 
@@ -483,6 +484,24 @@ TEST(cell_oob) {
     } catch (const InvalidArgument&) {}
 }
 
+TEST(logical_cell_on_padded_grid) {
+    World w({.nx = 3, .ny = 3, .seed = 4});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W})
+        w.add_rule(0, 0, d);
+    w.collapse();
+    assert(w.num_cells() == 16);
+    try {
+        (void)w.cell(9);
+        assert(false && "logical OOB should throw");
+    } catch (const InvalidArgument&) {}
+    auto cv = w.cell_at(2, 2);
+    assert(cv.collapsed());
+    assert(cv.pattern_id() == w.get_pattern(2, 2));
+    assert(cv.index() == 8);
+    assert((reinterpret_cast<uintptr_t>(w.c_ptr()->cells) % 64u) == 0);
+}
+
 TEST(class_limits) {
     World w({.nx = 8, .ny = 8, .seed = 42});
     w.add_pattern(Pattern(0, 0, 1.0f));
@@ -554,6 +573,7 @@ int main() {
     RUN(invalid_rule_throws);
     RUN(learn_too_small);
     RUN(cell_oob);
+    RUN(logical_cell_on_padded_grid);
     RUN(class_limits);
 
     std::cout << "\n========================================\n";

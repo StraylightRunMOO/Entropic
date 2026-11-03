@@ -371,10 +371,23 @@ public:
         return wfc_get_pattern(world_, pat_id);
     }
 
+    /* Logical linear index: z * ny * nx + y * nx + x, not the padded slot. */
     CellView cell(uint32_t idx) const {
         check();
-        if (idx >= world_->num_cells) throw InvalidArgument("Cell index out of range");
-        return CellView(&world_->cells[idx], idx);
+        uint32_t logical = world_->nx * world_->ny * world_->nz;
+        if (idx >= logical) throw InvalidArgument("Cell index out of range");
+        uint32_t x = idx % world_->nx;
+        uint32_t y = (idx / world_->nx) % world_->ny;
+        uint32_t z = idx / (world_->nx * world_->ny);
+        return CellView(&world_->cells[wfc_idx(world_, x, y, z)], idx);
+    }
+
+    CellView cell_at(uint32_t x, uint32_t y, uint32_t z = 0) const {
+        check();
+        if (x >= world_->nx || y >= world_->ny || z >= world_->nz)
+            throw InvalidArgument("Cell coordinates out of range");
+        uint32_t lin = (z * world_->ny + y) * world_->nx + x;
+        return CellView(&world_->cells[wfc_idx(world_, x, y, z)], lin);
     }
 
     /* -- Export grid -- */
@@ -436,7 +449,6 @@ struct GridCoords {
 static inline GridCoords idx_to_coords(const World& w, uint32_t idx) {
     uint32_t nx = w.nx();
     uint32_t ny = w.ny();
-    uint32_t nz = w.nz();
     uint32_t x = idx % nx;
     uint32_t y = (idx / nx) % ny;
     uint32_t z = idx / (nx * ny);

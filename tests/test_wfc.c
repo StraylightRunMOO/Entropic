@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdint.h>
 #include <time.h>
 
 static int test_count = 0;
@@ -378,7 +379,7 @@ TEST(rng_distribution) {
     assert(wfc_next_pow2_u32(1) == 1);
     assert(wfc_next_pow2_u32(2) == 2);
     assert(wfc_next_pow2_u32(5) == 8);
-    (void)wfc_next_pow2_u32(0); /* defined; 0 is not a power-of-two input */
+    assert(wfc_next_pow2_u32(0) == 1);
 }
 
 TEST(mask_eq_copy) {
@@ -389,6 +390,20 @@ TEST(mask_eq_copy) {
     assert(wfc_mask_eq(a, b));
     b[0] ^= 1;
     assert(!wfc_mask_eq(a, b));
+}
+
+TEST(cell_alignment) {
+    wfc_config_t cfg = {1, 1, 1, 1, 0, 0, 0, 0, 1.0f, 1.0f};
+    wfc_world_t* w = wfc_world_create(&cfg);
+    assert(w);
+    assert(((uintptr_t)w->cells % WFC_CELL_ALIGN) == 0);
+    assert((sizeof(wfc_cell_t) % WFC_CELL_ALIGN) == 0);
+    wfc_pattern_def_t p0 = {0, 0, 1.0f, 0, 0, {0}};
+    wfc_add_pattern(w, &p0);
+    add_full_rules(w, 1, 4);
+    assert(wfc_collapse(w) == WFC_OK);
+    assert(wfc_get_cell_pattern(w, 0, 0, 0) == 0);
+    wfc_world_destroy(w);
 }
 
 TEST(create_null_and_zero_seed) {
@@ -501,7 +516,9 @@ TEST(class_min_and_high_id) {
     wfc_add_pattern(w, &p1);
     add_full_rules(w, 2, 4);
     assert(wfc_set_class_limit(w, 1, 1, 16) == WFC_OK);
-    assert(wfc_set_class_limit(w, 40, 0, 2) == WFC_OK); /* >=32, no bitmask bit */
+    assert(wfc_set_class_limit(w, 40, 0, 2) == WFC_OK);
+    assert(w->class_constrained & (1ULL << 1));
+    assert(w->class_constrained & (1ULL << 40));
     assert(wfc_collapse(w) == WFC_OK);
     wfc_world_destroy(w);
 }
@@ -647,6 +664,7 @@ int main(void) {
     RUN(mask_eq_copy);
 
     /* Extra API / edge paths */
+    RUN(cell_alignment);
     RUN(create_null_and_zero_seed);
     RUN(get_pattern_and_export_errors);
     RUN(guaranteed_contradiction);

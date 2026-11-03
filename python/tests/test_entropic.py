@@ -49,6 +49,20 @@ def test_world_collapse_export():
     assert "CellView" in repr(cell)
 
 
+def test_logical_cell_index():
+    w = entropic.World(entropic.Config(nx=3, ny=3, seed=4))
+    w.add_pattern(entropic.Pattern(0, 0))
+    _full_rules(w, npat=1)
+    w.collapse()
+    assert w.num_cells() == 16
+    with pytest.raises(Exception):
+        w.cell(9)
+    at = w.cell_at(2, 2)
+    assert at.collapsed()
+    assert at.pattern_id() == w.get_pattern(2, 2)
+    assert at.index() == 8
+
+
 def test_step_mode():
     w = entropic.World(entropic.Config(nx=2, ny=2, seed=1))
     w.add_pattern(entropic.Pattern(0, 0))

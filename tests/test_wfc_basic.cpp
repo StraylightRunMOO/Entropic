@@ -1,6 +1,7 @@
 /* test_wfc_basic.cpp — C++ wrapper basic tests using Google Test */
 #include <gtest/gtest.h>
 #include <entropic/wfcpp.hpp>
+#include <cstdint>
 
 using namespace wfcpp;
 
@@ -46,6 +47,10 @@ TEST(WorldTest, Collapse1x1) {
     w.add_pattern(Pattern(0, 0));
     w.collapse();
     EXPECT_EQ(w.get_pattern(0, 0), 0);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(w.c_ptr()->cells) % 64u, 0u);
+    auto cv = w.cell(0);
+    EXPECT_TRUE(cv.collapsed());
+    EXPECT_EQ(cv.pattern_id(), 0);
 }
 
 TEST(WorldTest, Collapse2x2) {
@@ -108,6 +113,23 @@ TEST(WorldTest, CellView) {
     auto cell = w.cell(0);
     EXPECT_TRUE(cell.collapsed());
     EXPECT_EQ(cell.pattern_id(), 0);
+}
+
+TEST(WorldTest, LogicalCellIndexOnPaddedGrid) {
+    /* 3x3 allocates 4x4; cell(i) is logical, not the padded slot. */
+    World w({.nx = 3, .ny = 3, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W})
+        w.add_rule(0, 0, d);
+    w.collapse();
+    EXPECT_EQ(w.num_cells(), 16u);
+    EXPECT_THROW(w.cell(9), InvalidArgument);
+    auto c8 = w.cell(8);
+    EXPECT_TRUE(c8.collapsed());
+    EXPECT_EQ(c8.pattern_id(), w.get_pattern(2, 2));
+    auto at = w.cell_at(2, 2);
+    EXPECT_EQ(at.pattern_id(), w.get_pattern(2, 2));
+    EXPECT_EQ(at.index(), 8u);
 }
 
 TEST(WorldTest, SeamlessMode) {

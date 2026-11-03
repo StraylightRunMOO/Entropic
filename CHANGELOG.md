@@ -17,6 +17,10 @@ Python API surface.
   sets `copula_rho`; spectral also runs Matérn
 - C++ examples: 3D, API tour (`c_ptr`, move, CellView), wavelets
 - Python examples under `python/examples/`
+- 64-byte aligned `wfc_cell_t` allocation (`posix_memalign` / `_aligned_malloc`);
+  C++ `CellView` uses logical indices; `class_constrained` is a `uint64_t` bitset
+- Hierarchy residual upsamples a pattern signature (class + id), not tile weight
+- ASan/UBSan apply whenever `ENTROPIC_ENABLE_SANITIZERS=ON`, including RelWithDebInfo
 
 ## v1.1.0
 
