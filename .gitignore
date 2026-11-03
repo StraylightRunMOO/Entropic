@@ -1,0 +1,40 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Binaries
+test_wfc
+bench_wfc
+example_basic
+example_3d
+example_cpp
+example_spectral
+example_copula
+example_kowloon
+example_stepwise
+example_cpp_advanced
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.egg-info/
+dist/
+*.whl
+
+# Archives
+*.zip
+*.tar.gz

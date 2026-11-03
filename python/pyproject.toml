@@ -1,0 +1,36 @@
+[build-system]
+requires = ["scikit-build-core>=0.5", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "entropic"
+version = "1.0.0"
+description = "Wave Function Collapse HPC Engine — Python bindings"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "StraylightRunMOO"}
+]
+dependencies = ["numpy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: C",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/StraylightRunMOO/Entropic"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+cmake.args = ["-DCMAKE_POSITION_INDEPENDENT_CODE=ON"]
+
+[tool.scikit-build.cmake.define]
+CMAKE_POSITION_INDEPENDENT_CODE = "ON"

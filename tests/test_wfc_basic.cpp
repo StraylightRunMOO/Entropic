@@ -1,0 +1,188 @@
+/* test_wfc_basic.cpp — C++ wrapper basic tests using Google Test */
+#include <gtest/gtest.h>
+#include <entropic/wfcpp.hpp>
+
+using namespace wfcpp;
+
+TEST(WorldTest, CreateDestroy) {
+    Config cfg{.nx = 8, .ny = 8, .nz = 1, .seed = 42};
+    World w(cfg);
+    EXPECT_EQ(w.nx(), 8);
+    EXPECT_EQ(w.ny(), 8);
+    EXPECT_EQ(w.nz(), 1);
+    EXPECT_EQ(w.num_cells(), 64);
+    EXPECT_FALSE(w.is_3d());
+}
+
+TEST(WorldTest, MoveSemantics) {
+    Config cfg{.nx = 4, .ny = 4, .seed = 42};
+    World w1(cfg);
+    World w2(std::move(w1));
+    EXPECT_EQ(w2.nx(), 4);
+}
+
+TEST(WorldTest, AddPattern) {
+    World w({.nx = 4, .ny = 4, .seed = 42});
+    w.add_pattern(Pattern(0, 0, 1.0f));
+    w.add_pattern(Pattern(1, 0, 1.0f));
+    EXPECT_EQ(w.num_patterns(), 2);
+}
+
+TEST(WorldTest, InvalidPatternThrows) {
+    World w({.nx = 4, .ny = 4, .seed = 42});
+    Pattern bad{256, 0, 1.0f};
+    EXPECT_THROW(w.add_pattern(bad), InvalidArgument);
+}
+
+TEST(WorldTest, AddRule) {
+    World w({.nx = 4, .ny = 4, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    w.add_pattern(Pattern(1, 0));
+    w.add_rule(0, 1, Dir::E);
+}
+
+TEST(WorldTest, Collapse1x1) {
+    World w({.nx = 1, .ny = 1, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    w.collapse();
+    EXPECT_EQ(w.get_pattern(0, 0), 0);
+}
+
+TEST(WorldTest, Collapse2x2) {
+    World w({.nx = 2, .ny = 2, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    w.add_pattern(Pattern(1, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    w.collapse();
+    for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 2; x++)
+            EXPECT_TRUE(w.get_pattern(x, y) == 0 || w.get_pattern(x, y) == 1);
+}
+
+TEST(WorldTest, ExportGrid) {
+    World w({.nx = 2, .ny = 2, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W})
+        w.add_rule(0, 0, d);
+    w.collapse();
+    auto grid = w.export_grid();
+    EXPECT_EQ(grid.size(), 4);
+    for (auto p : grid) EXPECT_EQ(p, 0);
+}
+
+TEST(WorldTest, Reset) {
+    World w({.nx = 2, .ny = 2, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W})
+        w.add_rule(0, 0, d);
+    w.collapse();
+    EXPECT_EQ(w.get_pattern(0, 0), 0);
+    w.reset();
+    EXPECT_EQ(w.num_patterns(), 1);
+}
+
+TEST(WorldTest, StepByStep) {
+    World w({.nx = 2, .ny = 2, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W})
+        w.add_rule(0, 0, d);
+    w.step_init();
+    int count = 0;
+    while (w.step()) {
+        count++;
+        ASSERT_LT(count, 100);
+    }
+    EXPECT_GT(count, 0);
+    EXPECT_TRUE(w.step_done());
+}
+
+TEST(WorldTest, CellView) {
+    World w({.nx = 1, .ny = 1, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    w.collapse();
+    auto cell = w.cell(0);
+    EXPECT_TRUE(cell.collapsed());
+    EXPECT_EQ(cell.pattern_id(), 0);
+}
+
+TEST(WorldTest, SeamlessMode) {
+    World w({.nx = 4, .ny = 4, .seed = 42, .seamless = true});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W})
+        w.add_rule(0, 0, d);
+    w.collapse();
+}
+
+TEST(WorldTest, GridToString) {
+    World w({.nx = 2, .ny = 2, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W})
+        w.add_rule(0, 0, d);
+    w.collapse();
+    auto grid = w.export_grid();
+    auto s = grid_to_string(w, grid);
+    EXPECT_FALSE(s.empty());
+}
+
+TEST(ConfigTest, Defaults) {
+    Config cfg;
+    EXPECT_EQ(cfg.nx, 64);
+    EXPECT_EQ(cfg.ny, 64);
+    EXPECT_EQ(cfg.nz, 1);
+    EXPECT_FALSE(cfg.seamless);
+}
+
+TEST(PatternTest, Defaults) {
+    Pattern p;
+    EXPECT_EQ(p.weight, 1.0f);
+}
+
+TEST(PatternTest, Builder) {
+    Pattern p(5, 2, 0.5f);
+    EXPECT_EQ(p.id, 5);
+    EXPECT_EQ(p.class_id, 2);
+    EXPECT_EQ(p.weight, 0.5f);
+}
+
+TEST(DirTest, Opposite) {
+    EXPECT_EQ(opposite(Dir::N), Dir::S);
+    EXPECT_EQ(opposite(Dir::S), Dir::N);
+    EXPECT_EQ(opposite(Dir::E), Dir::W);
+    EXPECT_EQ(opposite(Dir::W), Dir::E);
+    EXPECT_EQ(opposite(Dir::U), Dir::D);
+    EXPECT_EQ(opposite(Dir::D), Dir::U);
+}
+
+TEST(WorldTest, LearnFromSample) {
+    World w({.nx = 4, .ny = 4, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    w.add_pattern(Pattern(1, 0));
+    std::vector<uint16_t> sample = {
+        0,1,0,1,
+        1,0,1,0,
+        0,1,0,1,
+        1,0,1,0
+    };
+    w.learn_from_sample(sample, 4, 4, 1);
+    w.collapse();
+}
+
+TEST(WorldTest, LargeCollapse) {
+    World w({.nx = 32, .ny = 32, .seed = 42});
+    w.add_pattern(Pattern(0, 0));
+    w.add_pattern(Pattern(1, 0));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    w.collapse();
+    auto grid = w.export_grid();
+    EXPECT_EQ(grid.size(), 1024);
+}
