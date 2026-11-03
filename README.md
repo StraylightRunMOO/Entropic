@@ -165,7 +165,7 @@ These are `#define`s set before including the header:
 ### Python bindings
 
 ```bash
-pip install ./python                   # pulls nanobind + scikit-build-core
+pip install .                          # from repo root; pulls nanobind + scikit-build-core
 python -c "import entropic; print(entropic.World(entropic.Config(nx=8, ny=8)))"
 ```
 
@@ -249,7 +249,9 @@ re-acquire it.
   this size. If your grid is 4096² and you need threads, this is not the
   library.
 - **Power-of-two padding wastes memory.** A 33×33 grid allocates as
-  64×64. The shifts buy fast index arithmetic; the waste is the price.
+  64×64. The solver only collapses the logical cells and fences off the
+  padding, but the memory is still allocated. The shifts buy fast index
+  arithmetic; the waste is the price.
 - **`WFC_MAX_PATTERNS` caps at 256.** The bitset is `uint64_t` words.
   256 patterns is 4 words per cell, 32 bytes per mask. Raise it and the
   bitset operations, the compatibility table, and the per-cell size all

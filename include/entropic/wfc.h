@@ -680,27 +680,30 @@ static inline void wfc_propagate_cell(wfc_world_t* w, uint32_t cell_idx, wfc_dir
     uint32_t x, y, z;
     wfc_cell_coords(w, cell_idx, &x, &y, &z);
 
-    uint32_t nx2 = w->nx_p2, ny2 = w->ny_p2, nz2 = w->nz_p2;
+    uint32_t nx2 = w->nx_p2, ny2 = w->ny_p2;
     uint32_t nidx = WFC_HEAP_INVALID;
 
+    /* Boundary checks use logical dimensions (nx/ny/nz), not padded (nx_p2/ny_p2/nz_p2).
+     * Padding cells are inert — propagation must not cross into them. */
     switch (dir) {
         case WFC_DIR_N: if (y > 0 || w->seamless) nidx = cell_idx - nx2; break;
-        case WFC_DIR_S: if (y + 1 < ny2 || w->seamless) nidx = cell_idx + nx2; break;
-        case WFC_DIR_E: if (x + 1 < nx2 || w->seamless) nidx = cell_idx + 1; break;
+        case WFC_DIR_S: if (y + 1 < w->ny || w->seamless) nidx = cell_idx + nx2; break;
+        case WFC_DIR_E: if (x + 1 < w->nx || w->seamless) nidx = cell_idx + 1; break;
         case WFC_DIR_W: if (x > 0 || w->seamless) nidx = cell_idx - 1; break;
         case WFC_DIR_U: if (z > 0 || w->seamless) nidx = cell_idx - nx2*ny2; break;
-        case WFC_DIR_D: if (z + 1 < nz2 || w->seamless) nidx = cell_idx + nx2*ny2; break;
+        case WFC_DIR_D: if (z + 1 < w->nz || w->seamless) nidx = cell_idx + nx2*ny2; break;
         default: break;
     }
 
     if (w->seamless && nidx == WFC_HEAP_INVALID) {
+        /* Wrap uses p2 stride for index arithmetic but logical dimensions for the wrap distance */
         switch (dir) {
-            case WFC_DIR_N: nidx = cell_idx + (ny2 - 1) * nx2; break;
-            case WFC_DIR_S: nidx = cell_idx - (ny2 - 1) * nx2; break;
-            case WFC_DIR_E: nidx = cell_idx - (nx2 - 1); break;
-            case WFC_DIR_W: nidx = cell_idx + (nx2 - 1); break;
-            case WFC_DIR_U: nidx = cell_idx + (nz2 - 1) * nx2 * ny2; break;
-            case WFC_DIR_D: nidx = cell_idx - (nz2 - 1) * nx2 * ny2; break;
+            case WFC_DIR_N: nidx = wfc_idx(w, x, w->ny - 1, z); break;
+            case WFC_DIR_S: nidx = wfc_idx(w, x, 0, z); break;
+            case WFC_DIR_E: nidx = wfc_idx(w, 0, y, z); break;
+            case WFC_DIR_W: nidx = wfc_idx(w, w->nx - 1, y, z); break;
+            case WFC_DIR_U: nidx = wfc_idx(w, x, y, w->nz - 1); break;
+            case WFC_DIR_D: nidx = wfc_idx(w, x, y, 0); break;
             default: break;
         }
     }
@@ -827,16 +830,18 @@ static inline float wfc_copula_class_prior(wfc_world_t* w, uint32_t cell_idx, ui
 
     const int ndirs = w->is_3d ? 6 : 4;
     for (int d = 0; d < ndirs; ++d) {
-        uint32_t nx = x, ny = y, nz = z;
+        uint32_t lx = x, ly = y, lz = z;
+        int valid = 1;
         switch (d) {
-            case WFC_DIR_N: ny = (ny + w->ny_p2 - 1) & (w->ny_p2 - 1); break;
-            case WFC_DIR_S: ny = (ny + 1) & (w->ny_p2 - 1); break;
-            case WFC_DIR_E: nx = (nx + 1) & (w->nx_p2 - 1); break;
-            case WFC_DIR_W: nx = (nx + w->nx_p2 - 1) & (w->nx_p2 - 1); break;
-            case WFC_DIR_U: nz = (nz + w->nz_p2 - 1) & (w->nz_p2 - 1); break;
-            case WFC_DIR_D: nz = (nz + 1) & (w->nz_p2 - 1); break;
+            case WFC_DIR_N: if (ly > 0) ly--; else if (w->seamless) ly = w->ny - 1; else valid = 0; break;
+            case WFC_DIR_S: if (ly + 1 < w->ny) ly++; else if (w->seamless) ly = 0; else valid = 0; break;
+            case WFC_DIR_E: if (lx + 1 < w->nx) lx++; else if (w->seamless) lx = 0; else valid = 0; break;
+            case WFC_DIR_W: if (lx > 0) lx--; else if (w->seamless) lx = w->nx - 1; else valid = 0; break;
+            case WFC_DIR_U: if (lz > 0) lz--; else if (w->seamless) lz = w->nz - 1; else valid = 0; break;
+            case WFC_DIR_D: if (lz + 1 < w->nz) lz++; else if (w->seamless) lz = 0; else valid = 0; break;
         }
-        uint32_t nidx = wfc_idx(w, nx, ny, nz);
+        if (!valid) continue;
+        uint32_t nidx = wfc_idx(w, lx, ly, lz);
         const wfc_cell_t* nbr = &w->cells[nidx];
         if (nbr->collapsed == WFC_PATTERN_INVALID) continue;
 
@@ -1226,14 +1231,14 @@ wfc_err_t wfc_collapse(wfc_world_t* w)
     w->step_collapsed_count = 0;
     w->step_target_collapses = w->nx * w->ny * w->nz;
 
-    /* Initialize heap with all uncollapsed cells */
+    /* Initialize heap with logical (non-padding) uncollapsed cells only */
     w->heap_size = 0;
     for (uint32_t i = 0; i < w->num_cells; ++i) {
         wfc_cell_t* cell = &w->cells[i];
+        if (cell->collapsed != WFC_PATTERN_INVALID) continue;
         cell->entropy = wfc_cell_entropy(w, cell);
         cell->prior = 0.0f;
         cell->dirty = 0;
-        /* Tie-breaking: add micro-noise to prevent directional bias */
         cell->entropy += wfc_tiebreak_noise(w, i);
 #if defined(WFC_USE_FFTW)
         if (w->spectral_enabled) cell->entropy += w->spectral_field[i] * w->spectral_weight;
@@ -1264,6 +1269,7 @@ wfc_err_t wfc_step_init(wfc_world_t* w)
     w->heap_size = 0;
     for (uint32_t i = 0; i < w->num_cells; ++i) {
         wfc_cell_t* cell = &w->cells[i];
+        if (cell->collapsed != WFC_PATTERN_INVALID) continue;
         cell->entropy = wfc_cell_entropy(w, cell);
         cell->prior = 0.0f;
         cell->dirty = 0;
@@ -1344,14 +1350,35 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
 
     w->queue_cap = w->num_cells;
 
-    /* Initialize cells: all patterns valid */
+    /* Initialize cells: logical cells get all patterns valid,
+     * padding cells (outside nx×ny×nz) are pre-collapsed as inert. */
     for (uint32_t i = 0; i < w->num_cells; ++i) {
         wfc_cell_t* c = &w->cells[i];
-        c->collapsed = WFC_PATTERN_INVALID;
-        c->entropy = 0.0f;
-        c->prior = 0.0f;
-        c->dirty = 0;
-        for (int b = 0; b < WFC_MASK_U64S; ++b) c->mask[b] = ~0ULL;
+        uint32_t cx, cy, cz;
+        if (w->is_3d) {
+            uint32_t p2 = w->nx_p2 * w->ny_p2;
+            cz = i / p2;
+            uint32_t rem = i % p2;
+            cy = rem >> w->log2_nx;
+            cx = rem & (w->nx_p2 - 1);
+        } else {
+            cz = 0;
+            cy = i >> w->log2_nx;
+            cx = i & (w->nx_p2 - 1);
+        }
+        if (cx >= w->nx || cy >= w->ny || cz >= w->nz) {
+            c->collapsed = 0;
+            c->entropy = -1.0f;
+            c->prior = 0.0f;
+            c->dirty = 0;
+            memset(c->mask, 0, sizeof(c->mask));
+        } else {
+            c->collapsed = WFC_PATTERN_INVALID;
+            c->entropy = 0.0f;
+            c->prior = 0.0f;
+            c->dirty = 0;
+            for (int b = 0; b < WFC_MASK_U64S; ++b) c->mask[b] = ~0ULL;
+        }
         w->heap_pos[i] = WFC_HEAP_INVALID;
     }
     memset(w->in_queue, 0, w->num_cells * sizeof(uint8_t));
@@ -1591,14 +1618,24 @@ void wfc_world_reset(wfc_world_t* w)
 {
     if (!w) return;
 
-    /* Reset cells to uncollapsed with all patterns valid */
+    /* Reset cells — mark padding cells as inert, logical cells as uncollapsed */
     for (uint32_t i = 0; i < w->num_cells; ++i) {
         wfc_cell_t* c = &w->cells[i];
-        c->collapsed = WFC_PATTERN_INVALID;
-        c->entropy = 0.0f;
-        c->prior = 0.0f;
-        c->dirty = 0;
-        for (int b = 0; b < WFC_MASK_U64S; ++b) c->mask[b] = ~0ULL;
+        uint32_t cx, cy, cz;
+        wfc_cell_coords(w, i, &cx, &cy, &cz);
+        if (cx >= w->nx || cy >= w->ny || cz >= w->nz) {
+            c->collapsed = 0;
+            c->entropy = -1.0f;
+            c->prior = 0.0f;
+            c->dirty = 0;
+            memset(c->mask, 0, sizeof(c->mask));
+        } else {
+            c->collapsed = WFC_PATTERN_INVALID;
+            c->entropy = 0.0f;
+            c->prior = 0.0f;
+            c->dirty = 0;
+            for (int b = 0; b < WFC_MASK_U64S; ++b) c->mask[b] = ~0ULL;
+        }
         w->heap_pos[i] = WFC_HEAP_INVALID;
     }
 

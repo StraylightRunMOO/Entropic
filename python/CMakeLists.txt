@@ -28,9 +28,17 @@ endif()
 # Build the extension module
 nanobind_add_module(_entropic src/entropic_py.cpp)
 
-target_include_directories(_entropic PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
-)
+# Headers: when built from repo root via scikit-build (cmake.source-dir = "python"),
+# CMAKE_SOURCE_DIR is the repo root. When built standalone, try parent dir.
+if(EXISTS "${CMAKE_SOURCE_DIR}/include/entropic/wfc.h")
+    set(ENTROPIC_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/include")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../include/entropic/wfc.h")
+    set(ENTROPIC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+else()
+    message(FATAL_ERROR "Cannot find entropic headers. Build from repo root: pip install .")
+endif()
+
+target_include_directories(_entropic PRIVATE ${ENTROPIC_INCLUDE_DIR})
 
 target_compile_definitions(_entropic PRIVATE
     WFC_ENABLE_COPULA
