@@ -107,11 +107,14 @@ dimensions (`nx_p2`, `ny_p2`), with a minimum of 4 on each axis.
 `[2, 8]` or if the coarsest scale would fall below 4×4. Weights scale
 as `1 / 2^shift`. The residual at level *k* is the difference between
 the target (or, with no target, zero) projected onto that scale by
-box-averaging logical cells, and the 2× upsample of the coarser
-level's **pattern signatures** (class bin plus a unique pattern-id
-sub-quantum — weights do not enter). Coupling between levels is only
-through the spectral bias field — there is no direct pattern locking
-from coarse codes.
+box-averaging logical cells, and the **1-level inverse DWT** of the
+coarser level's **pattern signatures** (class bin plus a unique
+pattern-id sub-quantum — weights do not enter). `wfc_hierarchy_set_wavelet`
+selects that DWT family (Haar is piecewise-constant 2×2; CDF 9/7
+interpolates) and the family used by Gumbel/Matérn synthesis. The residual
+field both orders observe (entropy) and Gumbel-tilts `wfc_choose_pattern`
+toward signatures that match the target. There is no direct pattern
+locking from coarse codes.
 
 ```c
 wfc_hierarchy_init(w, 3);                         /* 8×8 → 16×16 → 32×32 */

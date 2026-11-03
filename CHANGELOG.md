@@ -18,8 +18,15 @@ Python API surface.
 - C++ examples: 3D, API tour (`c_ptr`, move, CellView), wavelets
 - Python examples under `python/examples/`
 - 64-byte aligned `wfc_cell_t` allocation (`posix_memalign` / `_aligned_malloc`);
-  C++ `CellView` uses logical indices; `class_constrained` is a `uint64_t` bitset
-- Hierarchy residual upsamples a pattern signature (class + id), not tile weight
+  type-level `alignas`/`__attribute__((aligned))` plus explicit padding so C and
+  C++ agree on sizeof (GCC previously discarded a lone member `_Alignas`)
+- C++ `CellView` uses logical indices; `class_constrained` is a `uint64_t` bitset
+  with `1ULL << c` (class ids 32–63 are defined and enforced)
+- `wfc_world_reset` restores `rng_state` from the original seed
+- Hierarchy residual: 1-level inverse DWT upsample of pattern signatures;
+  residual Gumbel-tilts pattern choice, not only observe order
+- FAF Debug no longer bakes ASan/UBSan into consumers; C++ suspenders TUs
+  include `<stdint.h>` before `std::atomic<uint_fast32_t>`
 - ASan/UBSan apply whenever `ENTROPIC_ENABLE_SANITIZERS=ON`, including RelWithDebInfo
 
 ## v1.1.0

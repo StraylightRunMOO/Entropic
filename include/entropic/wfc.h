@@ -107,6 +107,11 @@
 #error "WFC_ENABLE_SUSPENDERS requires WFC_USE_FAF"
 #endif
 
+#include <stdint.h>
+#include <string.h>
+#include <float.h>
+#include <math.h>
+
 #ifdef WFC_ENABLE_SUSPENDERS
 #ifdef WFC_IMPLEMENTATION
 #ifndef MEMENTO_IMPLEMENTATION
@@ -120,8 +125,8 @@
 #include <suspenders.h>
 #include <sched.h>
 
-/* C11 atomics do not exist under these names in C++ (std::atomic only),
- * so route the operations this section uses through one spelling. */
+/* C11 <stdatomic.h> names do not exist in C++. Include <stdint.h> first so
+ * uint_fast32_t is visible, then route every op through WFC_ATOMIC_*. */
 #ifndef __cplusplus
 #include <stdatomic.h>
 typedef atomic_uint_fast32_t wfc_atomic_u32_t;
@@ -131,6 +136,7 @@ typedef atomic_int           wfc_atomic_int_t;
 #define WFC_ATOMIC_FETCH_SUB(p, v, mo) atomic_fetch_sub_explicit((p), (v), memory_order_##mo)
 #define WFC_ATOMIC_EXCHANGE(p, v, mo)  atomic_exchange_explicit((p), (v), memory_order_##mo)
 #else
+#include <cstdint>
 #include <atomic>
 typedef std::atomic<uint_fast32_t> wfc_atomic_u32_t;
 typedef std::atomic<int>           wfc_atomic_int_t;
@@ -143,11 +149,6 @@ typedef std::atomic<int>           wfc_atomic_int_t;
 #define WFC_PAR_MIN_DIM 32
 #endif
 #endif /* WFC_ENABLE_SUSPENDERS */
-
-#include <stdint.h>
-#include <string.h>
-#include <float.h>
-#include <math.h>
 
 /* C/C++ compatibility */
 #ifdef __cplusplus
@@ -204,21 +205,43 @@ typedef struct {
     uint16_t layer_types[WFC_MAX_LAYERS]; /* e.g. 1=grass, 2=bush */
 } wfc_pattern_def_t;
 
-/* Grid cell. First-member WFC_ALIGNAS(64) sets the type alignment in both
- * C and C++ (a leading `_Alignas` on the struct tag is ignored by clang).
+/* Grid cell. Alignment is pinned three ways because `_Alignas` on a struct
+ * tag is ignored by clang, and GCC has discarded a lone member `_Alignas`
+ * (sizeof 48 in C vs 64 in C++). Type-level alignas/attribute, first-member
+ * alignas, and explicit padding to a 64-byte stride must all agree.
  * Allocate arrays with the aligned allocator in wfc_world_create. */
-struct wfc_cell {
+#define WFC_CELL_PAYLOAD_BYTES ((WFC_MASK_U64S) * 8 + 13)
+#define WFC_CELL_PAD_BYTES \
+    (((WFC_CELL_PAYLOAD_BYTES) % (WFC_CELL_ALIGN)) \
+        ? ((WFC_CELL_ALIGN) - ((WFC_CELL_PAYLOAD_BYTES) % (WFC_CELL_ALIGN))) \
+        : 0)
+
+#if defined(__cplusplus)
+struct alignas(WFC_CELL_ALIGN) wfc_cell
+#elif defined(_MSC_VER)
+__declspec(align(64)) struct wfc_cell
+#elif defined(__GNUC__) || defined(__clang__)
+struct __attribute__((aligned(WFC_CELL_ALIGN))) wfc_cell
+#else
+struct wfc_cell
+#endif
+{
     WFC_ALIGNAS(WFC_CELL_ALIGN) uint64_t mask[WFC_MASK_U64S];
     uint16_t collapsed;                 /* WFC_PATTERN_INVALID if uncollapsed */
     uint16_t reserved;
     float    entropy;                   /* cached Shannon entropy */
     float    prior;                     /* copula/spectral prior offset */
     uint8_t  dirty;                     /* entropy needs recomputation */
+#if WFC_CELL_PAD_BYTES > 0
+    uint8_t  _pad[WFC_CELL_PAD_BYTES];
+#endif
 };
 typedef struct wfc_cell wfc_cell_t;
 
 WFC_STATIC_ASSERT(sizeof(wfc_cell_t) % WFC_CELL_ALIGN == 0,
     "wfc_cell_t size must be a multiple of WFC_CELL_ALIGN for aligned_alloc");
+WFC_STATIC_ASSERT(sizeof(wfc_cell_t) >= WFC_CELL_ALIGN,
+    "wfc_cell_t must occupy at least one aligned slot");
 #ifdef __cplusplus
 WFC_STATIC_ASSERT(alignof(wfc_cell_t) == WFC_CELL_ALIGN,
     "wfc_cell_t alignment must match WFC_CELL_ALIGN");
@@ -340,6 +363,7 @@ typedef struct wfc_world {
     int             faf_wavelet_family; /* FAF_WAVELET_*; default CDF 9/7 */
     uint32_t        faf_wavelet_levels; /* 0 = full decomposition */
     int             faf_live_family;    /* family the live transforms were built with */
+    int             spectral_guides_choice; /* 1: spectral_field is a signature target */
 #endif
 
     /* Copula */
@@ -365,6 +389,7 @@ typedef struct wfc_world {
 #endif
 
     /* RNG */
+    uint64_t rng_seed;                  /* original seed; restored by wfc_world_reset */
     uint64_t rng_state;
 
     /* Flags */
@@ -416,9 +441,10 @@ wfc_err_t wfc_set_matern_field(wfc_world_t* w, double kappa, double nu, uint64_t
 #endif
 
 /* Multiscale hierarchy. Call wfc_hierarchy_init, then optionally set_wavelet/set_target, then collapse.
- * set_wavelet selects the DWT family used by spectral field synthesis and caps the decomposition
- * depth used by its per-octave scaling. hierarchy_collapse requires spectral fields to be enabled:
- * the levels couple only through that bias, and without it the call returns WFC_EUNINIT. */
+ * set_wavelet selects the DWT family for (1) spectral Gumbel/Matérn synthesis and (2) the
+ * 1-level Mallat upsample / low-pass used by the residual cascade. hierarchy_collapse
+ * requires spectral fields: the residual is a signature target that both orders observe
+ * and Gumbel-tilts pattern choice. Without spectral the call returns WFC_EUNINIT. */
 #if defined(WFC_ENABLE_HIERARCHY)
 wfc_err_t wfc_hierarchy_init(wfc_world_t* w, uint32_t nlevels);
 wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_levels);
@@ -525,6 +551,23 @@ static inline float wfc_randf(uint64_t* state)
 {
     /* 53-bit precision float in [0,1) */
     return (float)((wfc_splitmix64(state) >> 11) * (1.0 / (1ULL << 53)));
+}
+
+/* Class bitset: 1ULL so class_id 32..63 is defined (1u << c is UB at 32). */
+static inline uint64_t wfc_class_bit(unsigned c)
+{
+    return (c < 64u) ? (UINT64_C(1) << c) : UINT64_C(0);
+}
+
+static inline void wfc_note_class_placed(wfc_world_t* w, uint16_t pat, int delta)
+{
+    uint16_t c = w->patterns[pat].class_id;
+    if (c >= (uint16_t)WFC_MAX_CLASSES) return;
+    if (delta > 0) {
+        w->class_placed[c]++;
+    } else if (w->class_placed[c] > 0) {
+        w->class_placed[c]--;
+    }
 }
 
 static inline uint32_t wfc_rand_range(uint64_t* state, uint32_t n)
@@ -925,7 +968,7 @@ static inline void wfc_propagate_from(wfc_world_t* w, uint32_t cell_idx)
 static inline void wfc_enforce_class_limits(wfc_world_t* w)
 {
     for (int c = 0; c < WFC_MAX_CLASSES; ++c) {
-        if (!(w->class_constrained & (1ULL << c))) continue;
+        if (!(w->class_constrained & wfc_class_bit((unsigned)c))) continue;
         if (w->class_placed[c] >= w->class_max[c]) {
             /* Remove all patterns of class c from every uncollapsed cell. */
             for (uint32_t i = 0; i < w->num_cells; ++i) {
@@ -1429,18 +1472,56 @@ wfc_err_t wfc_set_matern_field(wfc_world_t* w, double kappa, double nu, uint64_t
 
 #endif /* WFC_USE_FAF */
 
+#if defined(WFC_ENABLE_HIERARCHY)
+/* Identity embedding of a collapsed pattern for residual coupling.
+ * Class occupies the unit interval in equal bins; pattern id is a unique
+ * sub-quantum so two tiles with equal weight never alias. Invalid codes
+ * map to 0. Weights do not enter. */
+static inline float wfc_pattern_signature(const wfc_world_t* w, uint16_t code)
+{
+    if (!w || code == WFC_PATTERN_INVALID || code >= w->num_patterns)
+        return 0.0f;
+    const wfc_pattern_def_t* p = &w->patterns[code];
+    float nclass = (w->num_classes > 1) ? (float)w->num_classes : 1.0f;
+    float frac = (float)(p->id + 1) * (1.0f / (float)(WFC_MAX_PATTERNS + 1));
+    return ((float)p->class_id + frac) / nclass;
+}
+#endif
+
 /* --- Pattern choice --- */
 static inline uint16_t wfc_choose_pattern(wfc_world_t* w, const wfc_cell_t* cell)
 {
-    /* Weighted reservoir sampling from the valid mask. */
+    /* Weighted reservoir sampling from the valid mask.
+     * Hierarchy level worlds also Gumbel-tilt toward the residual target. */
     float total = 0.0f;
     uint16_t choice = WFC_PATTERN_INVALID;
+#if defined(WFC_ENABLE_HIERARCHY) && defined(WFC_USE_FAF)
+    float target = 0.0f;
+    int guide = w->spectral_guides_choice && w->spectral_enabled && w->spectral_field;
+    if (guide) {
+        uint32_t cidx = (uint32_t)(cell - w->cells);
+        if (cidx < w->num_cells) target = w->spectral_field[cidx];
+        if (target < 0.0f) target = 0.0f;
+        else if (target > 1.0f) target = 1.0f;
+    }
+#endif
     for (int b = 0; b < WFC_MASK_U64S; ++b) {
         uint64_t m = cell->mask[b];
         while (m) {
             uint64_t lsb = m & -m;
             int bit = __builtin_ctzll(m) + (b << 6);
             float wt = w->patterns[bit].weight;
+            if (wt <= 0.0f) { m ^= lsb; continue; }
+#if defined(WFC_ENABLE_HIERARCHY) && defined(WFC_USE_FAF)
+            if (guide) {
+                float sig = wfc_pattern_signature(w, (uint16_t)bit);
+                float d = sig - target;
+                float lambda = w->spectral_weight;
+                if (lambda < 0.0f) lambda = -lambda;
+                wt *= expf(-lambda * d * d);
+                if (wt < 1e-12f) wt = 1e-12f;
+            }
+#endif
             total += wt;
             if (wfc_randf(&w->rng_state) * total < wt)
                 choice = (uint16_t)bit;
@@ -1538,7 +1619,7 @@ static inline wfc_err_t wfc_collapse_one(wfc_world_t* w, uint32_t* out_cell_idx)
     cell->collapsed = pat;
     cell->entropy = -1.0f;
     cell->dirty = 0;
-    w->class_placed[w->patterns[pat].class_id]++;
+    wfc_note_class_placed(w, pat, 1);
 
     /* Propagate */
     w->queue_head = w->queue_tail = 0;
@@ -1558,7 +1639,7 @@ static inline wfc_err_t wfc_collapse_one(wfc_world_t* w, uint32_t* out_cell_idx)
 #if defined(WFC_ENABLE_BACKTRACK)
     if (w->contradiction) {
         if (w->backtrack_enabled && wfc_snapshot_pop(w)) {
-            w->class_placed[w->patterns[pat].class_id]--;
+            wfc_note_class_placed(w, pat, -1);
             return WFC_OK;
         }
         if (w->on_contradiction) {
@@ -1575,7 +1656,7 @@ static inline wfc_err_t wfc_collapse_one(wfc_world_t* w, uint32_t* out_cell_idx)
 #if defined(WFC_ENABLE_BACKTRACK)
     if (w->contradiction) {
         if (w->backtrack_enabled && wfc_snapshot_pop(w)) {
-            w->class_placed[w->patterns[pat].class_id]--;
+            wfc_note_class_placed(w, pat, -1);
             return WFC_OK;
         }
         if (w->on_contradiction) {
@@ -1599,6 +1680,9 @@ wfc_err_t wfc_collapse(wfc_world_t* w)
     w->step_mode = 0;
     w->step_collapsed_count = 0;
     w->step_target_collapses = w->nx * w->ny * w->nz;
+
+    /* Ban classes already at max (including max=0) before the first pick. */
+    wfc_enforce_class_limits(w);
 
     /* Initialize heap with logical (non-padding) uncollapsed cells only */
     w->heap_size = 0;
@@ -1634,6 +1718,8 @@ wfc_err_t wfc_step_init(wfc_world_t* w)
     w->step_mode = 1;
     w->step_collapsed_count = 0;
     w->step_target_collapses = w->nx * w->ny * w->nz;
+
+    wfc_enforce_class_limits(w);
 
     w->heap_size = 0;
     for (uint32_t i = 0; i < w->num_cells; ++i) {
@@ -1699,7 +1785,8 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
     w->nz = cfg->nz ? cfg->nz : 1;
     w->is_3d = (cfg->nz > 1);
     w->seamless = cfg->seamless;
-    w->rng_state = cfg->seed ? cfg->seed : 0x123456789ABCDEF0ULL;
+    w->rng_seed = cfg->seed ? cfg->seed : 0x123456789ABCDEF0ULL;
+    w->rng_state = w->rng_seed;
 
     w->nx_p2 = wfc_next_pow2_u32(w->nx);
     w->ny_p2 = wfc_next_pow2_u32(w->ny);
@@ -1784,6 +1871,7 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
     w->faf_wavelet_family = FAF_WAVELET_CDF97;
     w->faf_wavelet_levels = 0;
     w->faf_live_family = 0;
+    w->spectral_guides_choice = 0;
 #endif
 
     /* Copula */
@@ -1850,6 +1938,7 @@ void wfc_world_destroy(wfc_world_t* w)
 wfc_err_t wfc_add_pattern(wfc_world_t* w, const wfc_pattern_def_t* pat)
 {
     if (!w || !pat || pat->id >= WFC_MAX_PATTERNS) return WFC_EINVAL;
+    if (pat->class_id >= WFC_MAX_CLASSES) return WFC_EINVAL;
     if (w->num_patterns >= WFC_MAX_PATTERNS) return WFC_EINVAL;
     w->patterns[pat->id] = *pat;
     if (pat->class_id < WFC_MAX_CLASSES) {
@@ -1889,9 +1978,9 @@ wfc_err_t wfc_set_class_limit(wfc_world_t* w, uint16_t class_id, uint32_t min_co
     w->class_min[class_id] = min_count;
     w->class_max[class_id] = max_count;
     if (min_count > 0 || max_count < 0xFFFFFFFFu)
-        w->class_constrained |= (1ULL << class_id);
+        w->class_constrained |= wfc_class_bit(class_id);
     else
-        w->class_constrained &= ~(1ULL << class_id);
+        w->class_constrained &= ~wfc_class_bit(class_id);
     return WFC_OK;
 }
 
@@ -2033,6 +2122,7 @@ void wfc_world_reset(wfc_world_t* w)
     }
 
     memset(w->class_placed, 0, sizeof(w->class_placed));
+    w->rng_state = w->rng_seed;
     w->heap_size = 0;
     w->queue_head = w->queue_tail = 0;
     if (w->in_queue) memset(w->in_queue, 0, w->num_cells * sizeof(uint8_t));
@@ -2129,7 +2219,7 @@ wfc_err_t wfc_hierarchy_init(wfc_world_t* w, uint32_t nlevels)
         s->nx_p2 = lnx;
         s->ny_p2 = lny;
         s->ncells = lnx * lny;
-        s->weight = 1.0f / (float)(1u << shift);
+        s->weight = ldexpf(1.0f, -(int)shift);
 
         s->residual_field = (float*)faf_aligned_alloc(s->ncells * sizeof(float));
         s->recon_field    = (float*)faf_aligned_alloc(s->ncells * sizeof(float));
@@ -2209,51 +2299,119 @@ static wfc_world_t* wfc_hierarchy_create_level_world(wfc_world_t* parent, const 
     /* Copy class limits */
     memcpy(lw->class_min, parent->class_min, sizeof(lw->class_min));
     memcpy(lw->class_max, parent->class_max, sizeof(lw->class_max));
+    lw->class_constrained = parent->class_constrained;
+    lw->spectral_guides_choice = 1;
 
     return lw;
 }
 
-/* Identity embedding of a collapsed pattern for residual coupling.
- * Class occupies the unit interval in equal bins; pattern id is a unique
- * sub-quantum so two tiles with equal weight never alias. Invalid codes
- * map to 0. Weights do not enter. */
-static inline float wfc_pattern_signature(const wfc_world_t* w, uint16_t code)
+/* 1-level inverse DWT: Mallat LL holds `src` (cnx×cny), details are zero.
+ * Family (Haar vs CDF 9/7) shapes the 2× synthesis. */
+static wfc_err_t wfc_hierarchy_dwt_synthesize(wfc_world_t* lw,
+                                              const float* WFC_RESTRICT src,
+                                              uint32_t snx, uint32_t sny,
+                                              float* WFC_RESTRICT dst,
+                                              uint32_t dnx, uint32_t dny)
 {
-    if (!w || code == WFC_PATTERN_INVALID || code >= w->num_patterns)
-        return 0.0f;
-    const wfc_pattern_def_t* p = &w->patterns[code];
-    float nclass = (w->num_classes > 1) ? (float)w->num_classes : 1.0f;
-    float frac = (float)(p->id + 1) * (1.0f / (float)(WFC_MAX_PATTERNS + 1));
-    return ((float)p->class_id + frac) / nclass;
+    uint32_t saved = lw->faf_wavelet_levels;
+    lw->faf_wavelet_levels = 1;
+    if (lw->faf_initialized) wfc_faf_teardown_transforms(lw);
+    wfc_err_t err = wfc_faf_ensure_transforms(lw);
+    if (err != WFC_OK) {
+        lw->faf_wavelet_levels = saved;
+        return err;
+    }
+
+    uint32_t nx = lw->nx_p2, ny = lw->ny_p2;
+    size_t n = 2u * (size_t)nx * (size_t)ny;
+    float* buf = (float*)faf_aligned_alloc(n * sizeof(float));
+    if (!buf) {
+        lw->faf_wavelet_levels = saved;
+        return WFC_ENOMEM;
+    }
+    memset(buf, 0, n * sizeof(float));
+
+    uint32_t hx = nx / 2, hy = ny / 2;
+    for (uint32_t y = 0; y < sny && y < hy; ++y)
+        for (uint32_t x = 0; x < snx && x < hx; ++x)
+            buf[2 * (y * nx + x)] = src[y * snx + x];
+
+    wfc_faf_dwt_2d_inverse(lw, buf);
+
+    memset(dst, 0, (size_t)dnx * (size_t)dny * sizeof(float));
+    for (uint32_t y = 0; y < dny && y < ny; ++y)
+        for (uint32_t x = 0; x < dnx && x < nx; ++x)
+            dst[y * dnx + x] = buf[2 * (y * nx + x)];
+
+    faf_aligned_free(buf);
+    lw->faf_wavelet_levels = saved;
+    wfc_faf_teardown_transforms(lw);
+    return WFC_OK;
 }
 
-/* Upsample coarse_codes to a float field at 2x resolution.
- * Each coarse cell maps to a 2x2 block filled with its pattern signature.
- * This is a spectral bias, not a hard lock of the finer patterns. */
-static void wfc_hierarchy_upsample(const wfc_world_t* WFC_RESTRICT parent,
-                                   const wfc_scale_t* WFC_RESTRICT coarse,
-                                   float* WFC_RESTRICT fine_field,
-                                   uint32_t fine_nx, uint32_t fine_ny)
+/* 1-level forward DWT, drop LH/HL/HH, inverse: family-dependent low-pass. */
+static wfc_err_t wfc_hierarchy_dwt_lowpass(wfc_world_t* lw,
+                                           float* WFC_RESTRICT field,
+                                           uint32_t fnx, uint32_t fny)
 {
-    memset(fine_field, 0, (size_t)fine_nx * (size_t)fine_ny * sizeof(float));
+    uint32_t saved = lw->faf_wavelet_levels;
+    lw->faf_wavelet_levels = 1;
+    if (lw->faf_initialized) wfc_faf_teardown_transforms(lw);
+    wfc_err_t err = wfc_faf_ensure_transforms(lw);
+    if (err != WFC_OK) {
+        lw->faf_wavelet_levels = saved;
+        return err;
+    }
 
-    for (uint32_t cy = 0; cy < coarse->ny; ++cy) {
-        for (uint32_t cx = 0; cx < coarse->nx; ++cx) {
-            uint16_t code = coarse->coarse_codes[cy * coarse->nx + cx];
-            float val = wfc_pattern_signature(parent, code);
+    uint32_t nx = lw->nx_p2, ny = lw->ny_p2;
+    size_t n = 2u * (size_t)nx * (size_t)ny;
+    float* buf = (float*)faf_aligned_alloc(n * sizeof(float));
+    if (!buf) {
+        lw->faf_wavelet_levels = saved;
+        return WFC_ENOMEM;
+    }
+    memset(buf, 0, n * sizeof(float));
+    for (uint32_t y = 0; y < fny && y < ny; ++y)
+        for (uint32_t x = 0; x < fnx && x < nx; ++x)
+            buf[2 * (y * nx + x)] = field[y * fnx + x];
 
-            uint32_t fx = cx * 2, fy = cy * 2;
-            if (fx < fine_nx && fy < fine_ny) {
-                fine_field[fy * fine_nx + fx] = val;
-                if (fx + 1 < fine_nx)
-                    fine_field[fy * fine_nx + fx + 1] = val;
-                if (fy + 1 < fine_ny)
-                    fine_field[(fy + 1) * fine_nx + fx] = val;
-                if (fx + 1 < fine_nx && fy + 1 < fine_ny)
-                    fine_field[(fy + 1) * fine_nx + fx + 1] = val;
-            }
+    wfc_faf_dwt_2d_forward(lw, buf);
+    uint32_t hx = nx / 2, hy = ny / 2;
+    for (uint32_t y = 0; y < ny; ++y) {
+        for (uint32_t x = 0; x < nx; ++x) {
+            if (y >= hy || x >= hx)
+                buf[2 * (y * nx + x)] = buf[2 * (y * nx + x) + 1] = 0.0f;
         }
     }
+    wfc_faf_dwt_2d_inverse(lw, buf);
+
+    for (uint32_t y = 0; y < fny && y < ny; ++y)
+        for (uint32_t x = 0; x < fnx && x < nx; ++x)
+            field[y * fnx + x] = buf[2 * (y * nx + x)];
+
+    faf_aligned_free(buf);
+    lw->faf_wavelet_levels = saved;
+    wfc_faf_teardown_transforms(lw);
+    return WFC_OK;
+}
+
+/* Wavelet 2× upsample of coarse_codes into a float field at fine resolution.
+ * Coarse signatures occupy the Mallat LL band; inverse DWT (configured family)
+ * synthesizes the fine recon. Haar is piecewise-constant 2×2; CDF 9/7 interpolates. */
+static wfc_err_t wfc_hierarchy_upsample(wfc_world_t* fine_lw,
+                                        const wfc_world_t* WFC_RESTRICT parent,
+                                        const wfc_scale_t* WFC_RESTRICT coarse,
+                                        float* WFC_RESTRICT fine_field,
+                                        uint32_t fine_nx, uint32_t fine_ny)
+{
+    float* ll = (float*)faf_aligned_alloc((size_t)coarse->ncells * sizeof(float));
+    if (!ll) return WFC_ENOMEM;
+    for (uint32_t i = 0; i < coarse->ncells; ++i)
+        ll[i] = wfc_pattern_signature(parent, coarse->coarse_codes[i]);
+    wfc_err_t err = wfc_hierarchy_dwt_synthesize(fine_lw, ll, coarse->nx, coarse->ny,
+                                                 fine_field, fine_nx, fine_ny);
+    faf_aligned_free(ll);
+    return err;
 }
 
 /* Residual cascade: coarse → fine.
@@ -2274,6 +2432,7 @@ wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w)
 
     for (uint32_t k = 0; k < h->nlevels; ++k) {
         wfc_scale_t* scale = &h->levels[k];
+        wfc_err_t err;
 
         wfc_world_t* lw = wfc_hierarchy_create_level_world(w, scale);
         if (!lw) return WFC_ENOMEM;
@@ -2284,13 +2443,24 @@ wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w)
                     wfc_hierarchy_project_target(w, h->target_field,
                                                  scale->nx, scale->ny,
                                                  scale->residual_field);
+                    /* Family-dependent low-pass so set_wavelet is live here. */
+                    err = wfc_hierarchy_dwt_lowpass(lw, scale->residual_field,
+                                                    scale->nx, scale->ny);
+                    if (err != WFC_OK) {
+                        wfc_world_destroy(lw);
+                        return err;
+                    }
                     memcpy(lw->spectral_field, scale->residual_field,
                            scale->ncells * sizeof(float));
                 }
             } else {
                 wfc_scale_t* prev = &h->levels[k - 1];
-                wfc_hierarchy_upsample(w, prev, scale->recon_field,
-                                       scale->nx, scale->ny);
+                err = wfc_hierarchy_upsample(lw, w, prev, scale->recon_field,
+                                             scale->nx, scale->ny);
+                if (err != WFC_OK) {
+                    wfc_world_destroy(lw);
+                    return err;
+                }
                 if (h->target_field) {
                     wfc_hierarchy_project_target(w, h->target_field,
                                                  scale->nx, scale->ny,
@@ -2304,11 +2474,13 @@ wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w)
                 } else {
                     for (uint32_t i = 0; i < scale->ncells; ++i)
                         lw->spectral_field[i] = scale->recon_field[i] * scale->weight;
+                    memcpy(scale->residual_field, lw->spectral_field,
+                           scale->ncells * sizeof(float));
                 }
             }
         }
 
-        wfc_err_t err = wfc_collapse(lw);
+        err = wfc_collapse(lw);
         if (err != WFC_OK) {
             wfc_world_destroy(lw);
             return err;
@@ -2589,10 +2761,16 @@ static inline void wfc_fill_noise_par(float* buf, uint32_t n, uint64_t noise_see
  * are allocated/freed normally.
  */
 
+#ifdef __cplusplus
+static wfc_atomic_int_t  wfc_susp_up{0};
+static wfc_atomic_int_t  wfc_susp_ready{0};
+static wfc_atomic_int_t  wfc_susp_init_err{0};
+#else
 static wfc_atomic_int_t  wfc_susp_up       = 0;
+static wfc_atomic_int_t  wfc_susp_ready    = 0;
+static wfc_atomic_int_t  wfc_susp_init_err = 0;
+#endif
 static pthread_t   wfc_susp_thread;
-static wfc_atomic_int_t  wfc_susp_ready;
-static wfc_atomic_int_t  wfc_susp_init_err;
 static unsigned    wfc_susp_nworkers;
 
 typedef struct {

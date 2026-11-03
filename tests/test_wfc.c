@@ -393,11 +393,14 @@ TEST(mask_eq_copy) {
 }
 
 TEST(cell_alignment) {
-    wfc_config_t cfg = {1, 1, 1, 1, 0, 0, 0, 0, 1.0f, 1.0f};
+    wfc_config_t cfg = {8, 8, 1, 1, 0, 0, 0, 0, 1.0f, 1.0f};
     wfc_world_t* w = wfc_world_create(&cfg);
     assert(w);
+    assert(sizeof(wfc_cell_t) % WFC_CELL_ALIGN == 0);
+    assert(sizeof(wfc_cell_t) >= WFC_CELL_ALIGN);
     assert(((uintptr_t)w->cells % WFC_CELL_ALIGN) == 0);
-    assert((sizeof(wfc_cell_t) % WFC_CELL_ALIGN) == 0);
+    for (uint32_t i = 0; i < w->num_cells; ++i)
+        assert(((uintptr_t)&w->cells[i] % WFC_CELL_ALIGN) == 0);
     wfc_pattern_def_t p0 = {0, 0, 1.0f, 0, 0, {0}};
     wfc_add_pattern(w, &p0);
     add_full_rules(w, 1, 4);
@@ -520,6 +523,56 @@ TEST(class_min_and_high_id) {
     assert(w->class_constrained & (1ULL << 1));
     assert(w->class_constrained & (1ULL << 40));
     assert(wfc_collapse(w) == WFC_OK);
+    wfc_world_destroy(w);
+}
+
+TEST(class_limits_32plus) {
+    /* 1u << c is UB at class 32; enforcement must use 1ULL and actually ban. */
+    const uint16_t ids[] = {32, 33, 40, 63};
+    for (unsigned t = 0; t < sizeof(ids) / sizeof(ids[0]); ++t) {
+        uint16_t cid = ids[t];
+        wfc_config_t cfg = {8, 8, 1, 7, 0, 0, 0, 0, 1.0f, 1.0f};
+        wfc_world_t* w = wfc_world_create(&cfg);
+        wfc_pattern_def_t p0 = {0, 0, 1.0f, 0, 0, {0}};
+        wfc_pattern_def_t p1 = {1, cid, 1.0f, 0, 0, {0}};
+        assert(wfc_add_pattern(w, &p0) == WFC_OK);
+        assert(wfc_add_pattern(w, &p1) == WFC_OK);
+        add_full_rules(w, 2, 4);
+        assert(wfc_set_class_limit(w, cid, 0, 3) == WFC_OK);
+        assert(w->class_constrained & (1ULL << cid));
+        assert(wfc_collapse(w) == WFC_OK);
+        int count = 0;
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+                if (wfc_get_cell_pattern(w, (uint32_t)x, (uint32_t)y, 0) == 1)
+                    count++;
+        assert(count <= 3);
+        wfc_world_destroy(w);
+    }
+    wfc_config_t cfg = {2, 2, 1, 1, 0, 0, 0, 0, 1.0f, 1.0f};
+    wfc_world_t* w = wfc_world_create(&cfg);
+    wfc_pattern_def_t bad = {0, WFC_MAX_CLASSES, 1.0f, 0, 0, {0}};
+    assert(wfc_add_pattern(w, &bad) == WFC_EINVAL);
+    wfc_world_destroy(w);
+}
+
+TEST(reset_restores_rng) {
+    wfc_config_t cfg = {6, 6, 1, 99, 0, 0, 0, 0, 1.0f, 1.0f};
+    wfc_world_t* w = wfc_world_create(&cfg);
+    wfc_pattern_def_t p0 = {0, 0, 1.0f, 0, 0, {0}};
+    wfc_pattern_def_t p1 = {1, 1, 1.0f, 0, 0, {0}};
+    wfc_add_pattern(w, &p0);
+    wfc_add_pattern(w, &p1);
+    add_full_rules(w, 2, 4);
+    assert(wfc_collapse(w) == WFC_OK);
+    uint16_t first[36];
+    assert(wfc_export_grid(w, first, 36) == WFC_OK);
+    wfc_world_reset(w);
+    assert(w->rng_state == w->rng_seed);
+    assert(wfc_collapse(w) == WFC_OK);
+    uint16_t second[36];
+    assert(wfc_export_grid(w, second, 36) == WFC_OK);
+    assert(memcmp(first, second, sizeof(first)) == 0);
     wfc_world_destroy(w);
 }
 
@@ -672,6 +725,8 @@ int main(void) {
     RUN(learn_3d);
     RUN(ud_rules_3d);
     RUN(class_min_and_high_id);
+    RUN(class_limits_32plus);
+    RUN(reset_restores_rng);
     RUN(step_errors_and_done);
 #if defined(WFC_ENABLE_BACKTRACK)
     RUN(backtrack_recovery);

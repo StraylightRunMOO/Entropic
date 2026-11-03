@@ -103,7 +103,23 @@ if(ENTROPIC_USE_FAF)
     set(BUILD_DOCS OFF CACHE BOOL "" FORCE)
     set(ENABLE_FP8 OFF CACHE BOOL "" FORCE)
     set(ENABLE_FP16 OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(fastandfourier)
+    # FAF's CMakeLists bakes -fsanitize=address,undefined into
+    # CMAKE_C_FLAGS_DEBUG and does not export a link requirement, so a
+    # Debug consumer without sanitizers dies on undefined __asan_* refs.
+    # Strip that bake; we re-apply sanitizers on the target when asked.
+    FetchContent_GetProperties(fastandfourier)
+    if(NOT fastandfourier_POPULATED)
+        FetchContent_Populate(fastandfourier)
+    endif()
+    file(READ "${fastandfourier_SOURCE_DIR}/CMakeLists.txt" _faf_cm)
+    string(REGEX REPLACE
+        "set\\(CMAKE_C_FLAGS_DEBUG[^\n]*\\)"
+        "set(CMAKE_C_FLAGS_DEBUG \"-g -O0\")"
+        _faf_cm "${_faf_cm}")
+    file(WRITE "${fastandfourier_SOURCE_DIR}/CMakeLists.txt" "${_faf_cm}")
+    if(NOT TARGET fastandfourier)
+        add_subdirectory(${fastandfourier_SOURCE_DIR} ${fastandfourier_BINARY_DIR})
+    endif()
     # FAF's CMakeLists uses CMAKE_SOURCE_DIR (wrong when consumed via
     # FetchContent).  Patch include dirs on the target directly.
     target_include_directories(fastandfourier PUBLIC
@@ -120,6 +136,12 @@ if(ENTROPIC_USE_FAF)
     if(ENTROPIC_ENABLE_SANITIZERS)
         target_compile_options(fastandfourier PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(fastandfourier PUBLIC -fsanitize=address,undefined)
+    else()
+        # Belt: cancel any leftover Debug sanitizer flags from FAF.
+        target_compile_options(fastandfourier PRIVATE
+            $<$<CONFIG:Debug>:-fno-sanitize=address,undefined>)
+        target_link_options(fastandfourier PRIVATE
+            $<$<CONFIG:Debug>:-fno-sanitize=address,undefined>)
     endif()
     message(STATUS "FastAndFourier enabled (wavelet backend; JIT uses cc at runtime, VM fallback otherwise)")
 endif()

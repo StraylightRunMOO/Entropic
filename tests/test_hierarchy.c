@@ -290,6 +290,69 @@ static void test_nonsquare_levels(void)
     printf(" PASS\n");
 }
 
+static void test_wavelet_family_shapes_residual(void)
+{
+    printf("  wavelet family shapes residual...");
+    wfc_world_t* a = make_world(16, 16, 21);
+    wfc_world_t* b = make_world(16, 16, 21);
+    float* tgt = (float*)malloc(a->num_cells * sizeof(float));
+    assert(tgt);
+    for (uint32_t y = 0; y < a->ny_p2; ++y)
+        for (uint32_t x = 0; x < a->nx_p2; ++x)
+            tgt[y * a->nx_p2 + x] = (float)x + 2.0f * (float)y;
+
+    assert(wfc_hierarchy_init(a, 2) == WFC_OK);
+    assert(wfc_hierarchy_init(b, 2) == WFC_OK);
+    assert(wfc_hierarchy_set_wavelet(a, FAF_WAVELET_HAAR, 1) == WFC_OK);
+    assert(wfc_hierarchy_set_wavelet(b, FAF_WAVELET_CDF97, 1) == WFC_OK);
+    assert(wfc_hierarchy_set_target(a, tgt, a->num_cells) == WFC_OK);
+    assert(wfc_hierarchy_set_target(b, tgt, b->num_cells) == WFC_OK);
+    assert(wfc_hierarchy_collapse(a) == WFC_OK);
+    assert(wfc_hierarchy_collapse(b) == WFC_OK);
+
+    int differs = 0;
+    wfc_scale_t* sa = &a->hierarchy->levels[0];
+    wfc_scale_t* sb = &b->hierarchy->levels[0];
+    for (uint32_t i = 0; i < sa->ncells; ++i)
+        if (sa->residual_field[i] != sb->residual_field[i]) differs = 1;
+    assert(differs && "Haar vs CDF97 must change the coarsest residual");
+
+    free(tgt);
+    wfc_world_destroy(a);
+    wfc_world_destroy(b);
+    printf(" PASS\n");
+}
+
+static void test_residual_guides_choice(void)
+{
+    printf("  residual guides pattern choice...");
+    wfc_config_t cfg = {0};
+    cfg.nx = 1;
+    cfg.ny = 1;
+    cfg.nz = 1;
+    cfg.seed = 3;
+    cfg.enable_spectral = 1;
+    cfg.spectral_weight = 8.0f;
+    wfc_world_t* w = wfc_world_create(&cfg);
+    assert(w);
+    wfc_pattern_def_t p0 = {0, 0, 1.0f};
+    wfc_pattern_def_t p1 = {1, 1, 1.0f};
+    wfc_add_pattern(w, &p0);
+    wfc_add_pattern(w, &p1);
+    for (int d = 0; d < 4; ++d) {
+        wfc_add_rule(w, 0, 0, d);
+        wfc_add_rule(w, 0, 1, d);
+        wfc_add_rule(w, 1, 0, d);
+        wfc_add_rule(w, 1, 1, d);
+    }
+    w->spectral_guides_choice = 1;
+    w->spectral_field[0] = wfc_pattern_signature(w, 1);
+    assert(wfc_collapse(w) == WFC_OK);
+    assert(wfc_get_cell_pattern(w, 0, 0, 0) == 1);
+    wfc_world_destroy(w);
+    printf(" PASS\n");
+}
+
 static void test_signature_not_weight(void)
 {
     printf("  signature not weight...");
@@ -363,6 +426,8 @@ int main(void)
     test_finest_writes_back();
     test_nonsquare_levels();
     test_signature_not_weight();
+    test_wavelet_family_shapes_residual();
+    test_residual_guides_choice();
     test_invalid_args();
 
     printf("\nAll hierarchy tests passed.\n");
