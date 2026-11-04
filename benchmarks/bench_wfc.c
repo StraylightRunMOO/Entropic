@@ -138,7 +138,8 @@ static void bench_hierarchy(const char* name, uint32_t nx, uint32_t ny, int n_ru
     double total_ms = 0;
     int successes = 0;
 
-    for (int r = 0; r < n_runs; r++) {
+    /* r == -1 builds the n >= 128 JIT kernel and is not timed. */
+    for (int r = -1; r < n_runs; r++) {
         wfc_world_t* w = wfc_world_create(&cfg);
         if (!w) continue;
 
@@ -159,6 +160,10 @@ static void bench_hierarchy(const char* name, uint32_t nx, uint32_t ny, int n_ru
         double t0 = now_ms();
         wfc_err_t err = wfc_hierarchy_collapse(w);
         double t1 = now_ms();
+        if (r < 0) {
+            wfc_world_destroy(w);
+            continue;
+        }
 
         if (err == WFC_OK) {
             successes++;
@@ -167,12 +172,36 @@ static void bench_hierarchy(const char* name, uint32_t nx, uint32_t ny, int n_ru
         wfc_world_destroy(w);
     }
 
-    if (successes > 0)
-        printf("%-20s %4dx%-4d        4-pattern hier %3d ok  avg=%.2fms  %.1f cells/us\n",
-               name, nx, ny, successes, total_ms / successes,
-               (nx * ny) / (total_ms / successes * 1000.0));
-    else
+    double single_ms = 0.0;
+    int single_ok = 0;
+    for (int r = 0; r < n_runs; r++) {
+        wfc_world_t* w = wfc_world_create(&cfg);
+        if (!w) continue;
+        for (int i = 0; i < 4; i++) {
+            wfc_pattern_def_t p = {(uint16_t)i, (uint16_t)(i % 4), 1.0f, 0, 0, {0}};
+            wfc_add_pattern(w, &p);
+        }
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                for (int d = 0; d < 4; d++)
+                    wfc_add_rule(w, (uint16_t)i, (uint16_t)j, (wfc_dir_t)d);
+        double t0 = now_ms();
+        wfc_err_t err = wfc_collapse(w);
+        double t1 = now_ms();
+        if (err == WFC_OK) { single_ok++; single_ms += (t1 - t0); }
+        wfc_world_destroy(w);
+    }
+
+    if (successes > 0 && single_ok > 0) {
+        double hms = total_ms / successes;
+        double sms = single_ms / single_ok;
+        printf("%-20s %4dx%-4d  hierarchy %.1f cells/us   single-scale %.1f cells/us\n",
+               name, nx, ny,
+               (nx * ny) / (hms * 1000.0),
+               (nx * ny) / (sms * 1000.0));
+    } else {
         printf("%-20s FAILED\n", name);
+    }
 }
 #endif
 

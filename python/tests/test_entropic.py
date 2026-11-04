@@ -196,3 +196,77 @@ def test_hierarchy():
     w.hierarchy_collapse()
     grid = w.export_grid()
     assert set(np.unique(grid)).issubset({0, 1})
+    assert w.hierarchy_residual_energy(0) >= 0.0
+
+
+@pytest.mark.skipif(not hasattr(entropic.World, "hierarchy_adopt_spectral"),
+                    reason="hierarchy not enabled in this build")
+def test_hierarchy_adopt_spectral():
+    cfg = entropic.Config(nx=32, ny=32, seed=7)
+    cfg.enable_spectral = True
+    cfg.spectral_weight = 1.0
+
+    def _world():
+        w = entropic.World(cfg)
+        w.add_pattern(entropic.Pattern(0, 0, 1.0))
+        w.add_pattern(entropic.Pattern(1, 1, 1.0))
+        _full_rules(w)
+        w.hierarchy_init(3)
+        return w
+
+    with pytest.raises(Exception):
+        entropic.World(cfg).hierarchy_adopt_spectral()
+
+    haar = _world()
+    cdf = _world()
+    # Family is selected before the field so each generator and each split differ.
+    haar.hierarchy_set_wavelet(0, 0)  # Haar
+    cdf.hierarchy_set_wavelet(3, 0)   # CDF 9/7
+    haar.set_gumbel_field(0.7, 11)
+    cdf.set_gumbel_field(0.7, 11)
+    haar.hierarchy_adopt_spectral()
+    cdf.hierarchy_adopt_spectral()
+    eh = [haar.hierarchy_residual_energy(k) for k in range(3)]
+    ec = [cdf.hierarchy_residual_energy(k) for k in range(3)]
+    assert sum(eh) > 0.0 and sum(ec) > 0.0
+    assert eh != ec
+    before = haar.hierarchy_residual_energy(0)
+    haar.hierarchy_set_mode(0)
+    haar.hierarchy_collapse()
+    assert haar.hierarchy_residual_energy(0) == before
+    with pytest.raises(Exception):
+        haar.hierarchy_set_mode(2)
+
+    matern = _world()
+    matern.hierarchy_set_wavelet(3, 0)
+    matern.set_matern_field(1.0, 1.5, 9)
+    matern.hierarchy_adopt_spectral()
+    assert sum(matern.hierarchy_residual_energy(k) for k in range(3)) > 0.0
+    matern.hierarchy_collapse()
+    grid = matern.export_grid()
+    assert set(np.unique(grid)).issubset({0, 1})
+
+
+def test_fix_cell_zero_weight():
+    w = entropic.World(entropic.Config(nx=8, ny=8, seed=3))
+    w.add_pattern(entropic.Pattern(0, 0, 1.0))
+    w.add_pattern(entropic.Pattern(1, 1, 0.0))
+    _full_rules(w)
+    w.fix_cell(2, 5, 0, 1)
+    with pytest.raises(Exception):
+        w.fix_cell(2, 5, 0, 1)
+    w.collapse()
+    grid = w.export_grid()
+    assert grid[0, 5, 2] == 1
+    assert int(np.count_nonzero(grid == 1)) == 1
+
+    blocked = entropic.World(entropic.Config(nx=4, ny=4, seed=1))
+    blocked.add_pattern(entropic.Pattern(0, 0, 1.0))
+    blocked.add_pattern(entropic.Pattern(1, 0, 1.0))
+    for d in (entropic.Dir.N, entropic.Dir.S, entropic.Dir.E, entropic.Dir.W):
+        blocked.add_rule(0, 0, d)
+        blocked.add_rule(1, 1, d)
+    blocked.fix_cell(0, 0, 0, 0)
+    blocked.fix_cell(1, 0, 0, 1)
+    with pytest.raises(Exception):
+        blocked.collapse()

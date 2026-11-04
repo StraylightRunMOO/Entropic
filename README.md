@@ -98,34 +98,60 @@ Low regions of the field collapse first. This orders observe; it does not
 change pattern weights.
 
 **Residual multiscale hierarchy** (`WFC_ENABLE_HIERARCHY`, requires
-`WFC_USE_FAF`). A coarse-to-fine cascade. Each level solves a temporary
-world whose patterns are scored by a Gaussian likelihood on their
-signatures. The finest level copies its result back to the main world.
+`WFC_USE_FAF`). A coarse-to-fine wavelet cascade. Detail subbands are
+retained and used. Each level solves a temporary world whose patterns
+are scored by a Gaussian likelihood on their signatures. The finest
+level copies its result back to the main world.
 
 ### How the residual hierarchy works
 
 Level sizes are successive right-shifts of the padded dimensions, minimum
 4 on each axis. `wfc_hierarchy_init` returns `WFC_EINVAL` if `nlevels` is
-outside `[2, 8]` or the coarsest scale would fall below 4×4. The data
-blend is `α = 2^(-shift)` (1 at the finest level).
+outside `[2, 8]` or the coarsest scale would fall below 4×4.
 
-The likelihood observes a signature, the same embedding the upsampler
-writes: class bin plus a unique pattern-id sub-quantum. Weights do not
-enter. With a user field, the coarsest observation is that field
-low-passed by a 1-level DWT. Each finer observation is
-`(1-α) * upsample(coarse signatures) + α * projected target`. With no
-user field the coarsest solve is ordinary WFC, and finer levels observe
-the upsampled signatures directly. `wfc_hierarchy_set_wavelet` selects
-the DWT family (Haar is piecewise-constant 2×2; CDF 9/7 interpolates)
-and the family used by Gumbel/Matérn synthesis. Pattern choice samples
+Let \(z^{(0)}\) be the target (or the spectral field passed as the target).
+Level \(k = 0\) is the coarsest approximation and \(k\) increases toward
+the finest grid. Detail samples LH/HL/HH from the Mallat split are stored
+on the level that owns that octave. `wfc_hierarchy_residual_energy` is
+their L2 norm. With a full-depth decomposition that energy falls as \(k\)
+grows: the coarse bands hold the large-scale residual, and finer bands
+hold what is left.
+
+\[
+\hat{z}^{(k)} = \hat{z}^{(k-1)} + R_k(\text{signatures}, \text{details}_k),
+\qquad
+z^{(k)} = z^{(k-1)} - \hat{z}^{(k)}
+\]
+
+\(R_0\) is a pure LL reconstruction (its details stay in \(z\) and bias
+the next level). Each finer observation is the upsampled coarse signatures
+plus the spatial synthesis of the detail bands owned at that scale.
+`wfc_hierarchy_set_wavelet` selects the family and the decomposition
+depth: `dwt_levels == 0` keeps every octave the grid can hold, otherwise
+it is that many octaves. The 2× step between adjacent scales is still one
+Mallat octave (Haar is piecewise-constant 2×2; CDF 9/7 interpolates).
+`wfc_hierarchy_set_mode(w, 1)` runs the same bands fine-to-coarse as an
+analysis pass. The default mode is coarse-to-fine.
+
+The likelihood observes a signature: class bin plus a unique pattern-id
+sub-quantum. Weights do not enter. With no user field the coarsest solve
+is ordinary WFC, and finer levels observe the upsampled signatures.
+Generating an fBm or Matérn field does not by itself become that target.
+`wfc_hierarchy_adopt_spectral` copies the live field and decomposes it
+once into the detail buffers, so the cascade starts from that wavelet
+residual. `set_target` still accepts any field and decomposes it when
+the cascade runs. Pattern choice samples
 `weight * exp(-|λ| (sig - observation)²)`. Observe uses the Shannon
 entropy of that posterior. Coarse ids are not locked into the finer world.
 
 ```c
-wfc_hierarchy_init(w, 3);                         /* 8×8 → 16×16 → 32×32 */
-wfc_hierarchy_set_wavelet(w, FAF_WAVELET_CDF97, 0); /* 0 = full DWT depth */
-wfc_hierarchy_set_target(w, field, w->num_cells); /* optional */
-wfc_hierarchy_collapse(w);                        /* writes back to w */
+wfc_hierarchy_init(w, 3);                           /* 8×8 → 16×16 → 32×32 */
+wfc_hierarchy_set_wavelet(w, FAF_WAVELET_CDF97, 0); /* 0 = full depth */
+wfc_hierarchy_set_target(w, field, w->num_cells);
+/* or: wfc_set_gumbel_field(w, 0.7, 1); wfc_hierarchy_adopt_spectral(w); */
+wfc_hierarchy_collapse(w);                          /* LL, then detail residuals */
+float e0 = wfc_hierarchy_residual_energy(w, 0);     /* coarsest details */
+float e1 = wfc_hierarchy_residual_energy(w, 1);     /* e1 < e0 */
 ```
 
 See `examples/example_hierarchy.c` and `python/examples/wavelets.py`.
@@ -246,9 +272,13 @@ file includes the header and defines nothing.
 | `wfc_set_gumbel_field` | Generate fBm spectral prior (requires FAF) |
 | `wfc_set_matern_field` | Generate Matérn spectral prior (requires FAF) |
 | `wfc_hierarchy_init` | Set up N-level coarse-to-fine hierarchy (requires FAF + hierarchy) |
-| `wfc_hierarchy_set_wavelet` | Choose wavelet family and decomposition levels |
+| `wfc_hierarchy_set_wavelet` | Wavelet family and residual depth (`0` = every octave) |
 | `wfc_hierarchy_set_target` | Provide a target field for residual biasing |
-| `wfc_hierarchy_collapse` | Solve via coarse-to-fine cascade |
+| `wfc_hierarchy_adopt_spectral` | Decompose the live fBm/Matérn field once into the detail buffers |
+| `wfc_hierarchy_set_mode` | `0` coarse-to-fine (default), `1` fine-to-coarse analysis |
+| `wfc_fix_cell` | Pin one cell before the solve, including a zero-weight pattern |
+| `wfc_hierarchy_residual_energy` | L2 of the detail samples stored at one level |
+| `wfc_hierarchy_collapse` | Solve via the residual cascade |
 | `wfc_collapse` | Full WFC solve |
 | `wfc_step_init` / `wfc_step` / `wfc_step_done` | Step-by-step mode for visualisation |
 | `wfc_set_contradiction_callback` | Register a callback fired on contradiction |
@@ -279,7 +309,9 @@ debug output, and `idx_to_coords` / `coords_to_idx` for index conversion.
 `wfcpp.hpp` defines `WFC_IMPLEMENTATION` internally — don't define it
 yourself when using the C++ header. With hierarchy enabled the wrapper
 forwards `hierarchy_init`, `hierarchy_set_wavelet`, `hierarchy_set_target`
-(`std::vector<float>` or pointer + count), and `hierarchy_collapse`.
+(`std::vector<float>` or pointer + count), `hierarchy_adopt_spectral`,
+`hierarchy_set_mode`, `hierarchy_residual_energy`, and `hierarchy_collapse`.
+`fix_cell` pins a cell before `collapse`.
 
 ### Python
 
@@ -301,7 +333,9 @@ With hierarchy enabled (`-DENTROPIC_USE_FAF=ON -DENTROPIC_ENABLE_HIERARCHY=ON`):
 w.hierarchy_init(3)
 w.hierarchy_set_wavelet(3, 0)          # FAF_WAVELET_CDF97, full depth
 w.hierarchy_set_target(field)          # 1-D float32 NumPy array, length num_cells
-w.hierarchy_collapse()
+# or: w.set_gumbel_field(0.7, 1); w.hierarchy_adopt_spectral()
+w.hierarchy_collapse()                 # coarse LL, then detail residuals
+e0 = w.hierarchy_residual_energy(0)    # coarsest details; finer levels are smaller
 ```
 
 The GIL is released during `collapse()` and `hierarchy_collapse()`.
@@ -394,6 +428,7 @@ C/C++ suites, each its own binary so `WFC_IMPLEMENTATION` is defined once:
 | `test_quality` | Constraint fidelity, learned checkerboard, weight histogram, seed determinism |
 | `test_faf_smoke` | FastAndFourier DWT (`ENTROPIC_USE_FAF`) |
 | `test_hierarchy` | Residual cascade (`ENTROPIC_ENABLE_HIERARCHY`) |
+| `test_hierarchy_wavelet` | Detail retention, energy, family, depth |
 | `test_suspenders` | Coroutine parallelism (`ENTROPIC_ENABLE_SUSPENDERS`) |
 | `fuzz_wfc_standalone` | Bounded PRNG fuzz (`ENTROPIC_ENABLE_FUZZ`); `fuzz_wfc` is the libFuzzer binary |
 

@@ -38,7 +38,7 @@ with `hasattr`.
 | `example_backtrack` | `example_backtrack.c` | `enable_backtracking` + contradiction callback |
 | `example_copula` | `example_copula.c` | Gaussian copula (`copula_rho` / `copula_z` set by hand) |
 | `example_gray_sobol` | `example_gray_sobol.c` | `gray_codes.h` + `sobol.h` (no `WFC_IMPLEMENTATION`) |
-| `example_kowloon` | `kowloon.c` | larger tile-set demo using Sobol |
+| `example_kowloon` | `kowloon.c` | larger tile-set demo; Sobol POIs and a pinned courtyard |
 | `example_spectral` | `example_spectral.c` | fBm Gumbel + Matérn priors (**FAF**) |
 | `example_hierarchy` | `example_hierarchy.c` | 3-level CDF 9/7 cascade (**FAF + hierarchy**) |
 | `example_parallel` | `example_parallel.c` | `wfc_parallel_init` on 64×64 (**FAF + suspenders**) |

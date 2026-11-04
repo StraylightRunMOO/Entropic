@@ -295,6 +295,11 @@ if(ENTROPIC_BUILD_TESTS)
         target_link_libraries(test_hierarchy PRIVATE wfc m)
         entropic_test_defaults(test_hierarchy)
         add_test(NAME hierarchy COMMAND test_hierarchy)
+
+        add_executable(test_hierarchy_wavelet tests/test_hierarchy_wavelet.c)
+        target_link_libraries(test_hierarchy_wavelet PRIVATE wfc m)
+        entropic_test_defaults(test_hierarchy_wavelet)
+        add_test(NAME hierarchy_wavelet COMMAND test_hierarchy_wavelet)
     endif()
 
     if(ENTROPIC_ENABLE_SUSPENDERS)

@@ -224,6 +224,15 @@ public:
         add_rule(pat_b, pat_a, opposite(dir));
     }
 
+    /* Pin a cell before collapse. Weight 0 is legal and will not be chosen
+     * in any other cell. */
+    void fix_cell(uint32_t x, uint32_t y, uint32_t z, uint16_t pat) {
+        check();
+        wfc_err_t err = wfc_fix_cell(world_, x, y, z, pat);
+        if (err == WFC_EINVAL) throw InvalidArgument("Invalid cell or pattern");
+        if (err != WFC_OK) throw Error("Failed to fix cell");
+    }
+
     /* -- Class constraints -- */
     void set_class_limit(uint16_t class_id, uint32_t min_count, uint32_t max_count) {
         check();
@@ -286,6 +295,28 @@ public:
 
     void hierarchy_set_target(const std::vector<float>& target) {
         hierarchy_set_target(target.data(), static_cast<uint32_t>(target.size()));
+    }
+
+    void hierarchy_set_mode(int mode) {
+        check();
+        wfc_err_t err = wfc_hierarchy_set_mode(world_, mode);
+        if (err == WFC_EUNINIT) throw Uninitialized("Hierarchy not initialised");
+        if (err == WFC_EINVAL) throw InvalidArgument("Invalid hierarchy mode");
+        if (err != WFC_OK) throw Error("Failed to set hierarchy mode");
+    }
+
+    /* Decompose the live fBm/Matérn field once into the detail buffers. */
+    void hierarchy_adopt_spectral() {
+        check();
+        wfc_err_t err = wfc_hierarchy_adopt_spectral(world_);
+        if (err == WFC_EUNINIT) throw Uninitialized("Hierarchy or spectral field is not ready");
+        if (err == WFC_ENOMEM) throw OutOfMemory("Failed to adopt spectral field");
+        if (err != WFC_OK) throw Error("Failed to adopt spectral field");
+    }
+
+    float hierarchy_residual_energy(uint32_t level) const {
+        check();
+        return wfc_hierarchy_residual_energy(world_, level);
     }
 
     void hierarchy_collapse() {

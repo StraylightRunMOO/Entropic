@@ -105,6 +105,7 @@ NB_MODULE(_entropic, m) {
              "pat_a"_a, "pat_b"_a, "dir"_a)
         .def("set_class_limit", &World::set_class_limit,
              "class_id"_a, "min_count"_a, "max_count"_a)
+        .def("fix_cell", &World::fix_cell, "x"_a, "y"_a, "z"_a, "pat"_a)
         .def("learn_from_sample", [](World& w, nb::ndarray<uint16_t, nb::ndim<1>> arr,
                                      uint32_t sx, uint32_t sy, uint32_t sz) {
             std::vector<uint16_t> v(arr.data(), arr.data() + arr.shape(0));
@@ -129,6 +130,9 @@ NB_MODULE(_entropic, m) {
             for (size_t i = 0; i < arr.ndim(); ++i) n *= arr.shape(i);
             w.hierarchy_set_target(arr.data(), static_cast<uint32_t>(n));
         }, "target"_a)
+        .def("hierarchy_set_mode", &World::hierarchy_set_mode, "mode"_a)
+        .def("hierarchy_adopt_spectral", &World::hierarchy_adopt_spectral)
+        .def("hierarchy_residual_energy", &World::hierarchy_residual_energy, "level"_a)
         .def("hierarchy_collapse", &World::hierarchy_collapse,
              nb::call_guard<nb::gil_scoped_release>())
 #endif

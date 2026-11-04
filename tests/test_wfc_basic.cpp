@@ -177,7 +177,53 @@ TEST(WorldTest, HierarchyInvalidNlevels) {
     EXPECT_THROW(w.hierarchy_init(1), InvalidArgument);
     EXPECT_THROW(w.hierarchy_init(9), InvalidArgument);
 }
+
+TEST(WorldTest, HierarchyAdoptSpectral) {
+    Config cfg{.nx = 32, .ny = 32, .seed = 7, .enable_spectral = true,
+               .spectral_weight = 1.0f};
+    World w(cfg);
+    w.add_pattern(Pattern(0, 0, 1.0f));
+    w.add_pattern(Pattern(1, 1, 1.0f));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    EXPECT_THROW(w.hierarchy_adopt_spectral(), Uninitialized);
+    w.hierarchy_init(3);
+    EXPECT_THROW(w.hierarchy_set_mode(2), InvalidArgument);
+    w.hierarchy_set_wavelet(FAF_WAVELET_HAAR, 0);
+    w.set_gumbel_field(0.6, 5);
+    w.hierarchy_adopt_spectral();
+    float e0 = w.hierarchy_residual_energy(0);
+    EXPECT_GT(e0, 0.0f);
+    w.hierarchy_collapse();
+    EXPECT_FLOAT_EQ(w.hierarchy_residual_energy(0), e0);
+    for (auto p : w.export_grid())
+        EXPECT_TRUE(p == 0 || p == 1);
+}
 #endif
+
+TEST(WorldTest, FixCellZeroWeight) {
+    World w({.nx = 8, .ny = 8, .seed = 3});
+    w.add_pattern(Pattern(0, 0, 1.0f));
+    w.add_pattern(Pattern(1, 1, 0.0f));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    w.fix_cell(2, 5, 0, 1);
+    EXPECT_THROW(w.fix_cell(9, 0, 0, 0), InvalidArgument);
+    w.collapse();
+    auto grid = w.export_grid();
+    EXPECT_EQ(grid[5 * 8 + 2], 1);
+    int air = 0;
+    for (auto p : grid) if (p == 1) air++;
+    EXPECT_EQ(air, 1);
+}
 
 TEST(ConfigTest, Defaults) {
     Config cfg;

@@ -339,7 +339,63 @@ TEST(hierarchy_invalid_nlevels) {
         assert(false && "should have thrown");
     } catch (const InvalidArgument&) {}
 }
+
+TEST(hierarchy_adopt_and_energy) {
+    Config cfg{.nx = 32, .ny = 32, .seed = 7, .enable_spectral = true,
+               .spectral_weight = 1.0f};
+    World w(cfg);
+    w.add_pattern(Pattern(0, 0, 1.0f));
+    w.add_pattern(Pattern(1, 1, 1.0f));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    try {
+        w.hierarchy_adopt_spectral();
+        assert(false && "adopt before init should throw");
+    } catch (const Uninitialized&) {}
+    w.hierarchy_init(3);
+    w.hierarchy_set_wavelet(FAF_WAVELET_CDF97, 0);
+    try {
+        w.hierarchy_set_mode(2);
+        assert(false && "bad mode should throw");
+    } catch (const InvalidArgument&) {}
+    w.hierarchy_set_mode(0);
+    w.set_gumbel_field(0.7, 11);
+    w.hierarchy_adopt_spectral();
+    float e0 = w.hierarchy_residual_energy(0);
+    assert(e0 > 0.0f);
+    w.hierarchy_collapse();
+    assert(w.hierarchy_residual_energy(0) == e0);
+    auto grid = w.export_grid();
+    for (auto p : grid) assert(p == 0 || p == 1);
+}
 #endif
+
+TEST(fix_cell_zero_weight) {
+    World w({.nx = 8, .ny = 8, .seed = 3});
+    w.add_pattern(Pattern(0, 0, 1.0f));
+    w.add_pattern(Pattern(1, 1, 0.0f));
+    for (auto d : {Dir::N, Dir::E, Dir::S, Dir::W}) {
+        w.add_rule(0, 0, d);
+        w.add_rule(0, 1, d);
+        w.add_rule(1, 0, d);
+        w.add_rule(1, 1, d);
+    }
+    w.fix_cell(2, 5, 0, 1);
+    try {
+        w.fix_cell(2, 5, 0, 1);
+        assert(false && "second pin should throw");
+    } catch (const InvalidArgument&) {}
+    w.collapse();
+    auto grid = w.export_grid();
+    assert(grid[5 * 8 + 2] == 1);
+    int air = 0;
+    for (auto p : grid) if (p == 1) air++;
+    assert(air == 1);
+}
 
 TEST(get_pattern_def_and_symmetric) {
     World w({.nx = 4, .ny = 4, .seed = 1});
@@ -555,7 +611,9 @@ int main() {
 #ifdef WFC_ENABLE_HIERARCHY
     RUN(hierarchy_collapse);
     RUN(hierarchy_invalid_nlevels);
+    RUN(hierarchy_adopt_and_energy);
 #endif
+    RUN(fix_cell_zero_weight);
     RUN(get_pattern_def_and_symmetric);
     RUN(uninitialized_after_move);
     RUN(three_d_export);

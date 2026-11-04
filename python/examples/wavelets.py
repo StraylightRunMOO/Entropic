@@ -58,9 +58,11 @@ def main():
         _two_tiles(w)
         w.hierarchy_init(3)
         w.hierarchy_set_wavelet(3, 0)
-        target = np.ones((w.num_cells(),), dtype=np.float32)
-        w.hierarchy_set_target(target)
+        w.set_gumbel_field(0.7, 11)
+        w.hierarchy_adopt_spectral()
+        e0 = w.hierarchy_residual_energy(0)
         w.hierarchy_collapse()
+        print(f"coarsest residual energy {e0:.4f}")
         print_preview(w.export_grid(), stride=2)
     else:
         print("\nhierarchy_init not in this build "

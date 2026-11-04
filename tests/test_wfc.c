@@ -766,6 +766,72 @@ TEST(seamless_torus) {
     wfc_world_destroy(w);
 }
 
+/* A mask-only pin of a zero-weight tile used to be stripped by the support
+ * intersection, and a collapsed pin never entered the opening AC-3. */
+TEST(fix_cell) {
+    wfc_config_t cfg = {8, 8, 1, 5, 0, 0, 0, 0, 1.0f, 1.0f};
+    wfc_world_t* w = wfc_world_create(&cfg);
+    wfc_pattern_def_t open = {0, 0, 1.0f, 0, 0, {0}};
+    wfc_pattern_def_t air = {1, 1, 0.0f, 0, 0, {0}};
+    wfc_add_pattern(w, &open);
+    wfc_add_pattern(w, &air);
+    add_full_rules(w, 2, 4);
+    assert(wfc_fix_cell(w, 3, 4, 0, 1) == WFC_OK);
+    assert(wfc_fix_cell(w, 3, 4, 0, 1) == WFC_EINVAL);
+    assert(wfc_fix_cell(w, 8, 0, 0, 0) == WFC_EINVAL);
+    assert(wfc_collapse(w) == WFC_OK);
+    assert(wfc_get_cell_pattern(w, 3, 4, 0) == 1);
+    uint32_t air_count = 0;
+    for (uint32_t y = 0; y < 8; y++)
+        for (uint32_t x = 0; x < 8; x++)
+            if (wfc_get_cell_pattern(w, x, y, 0) == 1) air_count++;
+    assert(air_count == 1);
+    wfc_world_destroy(w);
+
+    /* Positive-weight pin must constrain its neighbors, not only itself. */
+    wfc_config_t cfg2 = {8, 8, 1, 9, 0, 0, 0, 0, 1.0f, 1.0f};
+    w = wfc_world_create(&cfg2);
+    wfc_pattern_def_t sea = {0, 0, 1000.0f, 0, 0, {0}};
+    wfc_pattern_def_t isle = {1, 1, 1.0f, 0, 0, {0}};
+    wfc_add_pattern(w, &sea);
+    wfc_add_pattern(w, &isle);
+    for (int d = 0; d < 4; d++) {
+        wfc_add_rule(w, 0, 0, (wfc_dir_t)d);
+        wfc_add_rule(w, 1, 1, (wfc_dir_t)d);
+    }
+    assert(wfc_fix_cell(w, 3, 3, 0, 1) == WFC_OK);
+    assert(wfc_collapse(w) == WFC_OK);
+    for (uint32_t y = 0; y < 8; y++)
+        for (uint32_t x = 0; x < 8; x++)
+            assert(wfc_get_cell_pattern(w, x, y, 0) == 1);
+    wfc_world_destroy(w);
+
+    /* Adjacent pins that break a rule fail in prepare, before observe. */
+    w = wfc_world_create(&cfg);
+    wfc_add_pattern(w, &open);
+    wfc_pattern_def_t other = {1, 0, 1.0f, 0, 0, {0}};
+    wfc_add_pattern(w, &other);
+    for (int d = 0; d < 4; d++) {
+        wfc_add_rule(w, 0, 0, (wfc_dir_t)d);
+        wfc_add_rule(w, 1, 1, (wfc_dir_t)d);
+    }
+    assert(wfc_fix_cell(w, 0, 0, 0, 0) == WFC_OK);
+    assert(wfc_fix_cell(w, 1, 0, 0, 1) == WFC_OK);
+    assert(wfc_collapse(w) == WFC_ECONTRADICTION);
+    wfc_world_destroy(w);
+
+    /* 6×6 is not a power of two. The pin must use the padded index. */
+    wfc_config_t cfg3 = {6, 6, 1, 2, 0, 0, 0, 0, 1.0f, 1.0f};
+    w = wfc_world_create(&cfg3);
+    wfc_add_pattern(w, &open);
+    wfc_add_pattern(w, &air);
+    add_full_rules(w, 2, 4);
+    assert(wfc_fix_cell(w, 5, 3, 0, 1) == WFC_OK);
+    assert(wfc_collapse(w) == WFC_OK);
+    assert(wfc_get_cell_pattern(w, 5, 3, 0) == 1);
+    wfc_world_destroy(w);
+}
+
 int main(void) {
     printf("========================================\n");
     printf("WFC Engine C Test Suite\n");
@@ -815,6 +881,7 @@ int main(void) {
     RUN(class_limits_32plus);
     RUN(reset_restores_rng);
     RUN(step_errors_and_done);
+    RUN(fix_cell);
 #if defined(WFC_ENABLE_BACKTRACK)
     RUN(backtrack_recovery);
 #endif

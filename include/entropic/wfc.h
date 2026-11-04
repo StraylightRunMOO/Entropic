@@ -288,8 +288,19 @@ typedef struct wfc_scale {
     uint32_t ncells;
     float   *residual_field;            /* signature observation (Gaussian target) */
     float   *recon_field;               /* 2x upsample of coarser coarse_codes */
+    /* Mallat details owned by this level. detail_lh/hl/hh alias the primary
+     * octave inside detail_pack (band size nx/2 by ny/2) when that octave
+     * belongs here. detail_pack holds every owned LH/HL/HH sample. */
+    float   *detail_lh;
+    float   *detail_hl;
+    float   *detail_hh;
+    float   *detail_pack;
+    uint32_t detail_count;              /* live samples in detail_pack */
+    uint32_t detail_cap;
+    uint32_t octave_lo;                 /* inclusive, 0 = finest Mallat octave */
+    uint32_t octave_hi;                 /* exclusive */
     uint16_t *coarse_codes;             /* collapsed pattern per cell at this scale */
-    float    weight;                    /* data blend α = 2^(-shift); 1 at the finest */
+    float    weight;                    /* kept; the cascade no longer blends by it */
 } wfc_scale_t;
 
 typedef struct wfc_hierarchy {
@@ -297,8 +308,11 @@ typedef struct wfc_hierarchy {
     wfc_scale_t   *levels;
     uint32_t       finest_idx;
     int            wavelet_family;
-    uint32_t       wavelet_levels;
+    uint32_t       wavelet_levels;      /* 0 = full residual depth */
+    int            mode;                /* 0 coarse-to-fine, 1 fine-to-coarse */
+    int            decomposed;          /* 1: adopt_spectral already split the field */
     float         *target_field;
+    float         *running;             /* z^(k): target minus synthesized contributions */
 } wfc_hierarchy_t;
 #endif
 
@@ -387,6 +401,8 @@ typedef struct wfc_world {
     int             faf_wavelet_family; /* FAF_WAVELET_*; default CDF 9/7 */
     uint32_t        faf_wavelet_levels; /* 0 = full decomposition */
     int             faf_live_family;    /* family the live transforms were built with */
+    int             faf_row_shared;     /* row plans live in the process cache */
+    int             faf_col_shared;     /* col plans live in the process cache */
     int             spectral_guides_choice; /* 1: spectral_field is a signature target */
 #endif
 
@@ -454,6 +470,12 @@ wfc_err_t wfc_add_rule(wfc_world_t* w, uint16_t pat_a, uint16_t pat_b, wfc_dir_t
 /* Global class constraints (hard min / max counts). max=UINT32_MAX means unlimited. */
 wfc_err_t wfc_set_class_limit(wfc_world_t* w, uint16_t class_id, uint32_t min_count, uint32_t max_count);
 
+/* Pin one logical cell to `pat` before the solve. A zero-weight pattern is
+ * legal here and stays out of the support, so the solver will not choose it
+ * anywhere else. The opening AC-3 propagates from pinned cells. A second pin
+ * on the same cell returns WFC_EINVAL; reset the world first. */
+wfc_err_t wfc_fix_cell(wfc_world_t* w, uint32_t x, uint32_t y, uint32_t z, uint16_t pat);
+
 /* Learn rules, frequencies, and copula correlations from a sample grid. */
 wfc_err_t wfc_learn_from_sample(wfc_world_t* w, const uint16_t* sample_grid,
                                 uint32_t sx, uint32_t sy, uint32_t sz);
@@ -464,16 +486,26 @@ wfc_err_t wfc_set_gumbel_field(wfc_world_t* w, double H, uint64_t noise_seed);
 wfc_err_t wfc_set_matern_field(wfc_world_t* w, double kappa, double nu, uint64_t noise_seed);
 #endif
 
-/* Multiscale hierarchy. Call wfc_hierarchy_init, then optionally set_wavelet/set_target, then collapse.
- * set_wavelet selects the DWT family for (1) spectral Gumbel/Matérn synthesis and (2) the
- * 1-level Mallat upsample / low-pass used by the residual cascade. hierarchy_collapse
- * requires spectral fields: the residual is a signature target. Observe order is the
- * Shannon entropy of the Gaussian-reweighted posterior, and pattern choice samples
- * that posterior. Without spectral the call returns WFC_EUNINIT. */
+/* Multiscale hierarchy. Call wfc_hierarchy_init, then optionally set_wavelet/set_target/set_mode, then collapse.
+ * set_wavelet selects the DWT family and the residual decomposition depth. dwt_levels == 0
+ * decomposes every octave the padded grid can hold; any other value is that many octaves.
+ * The 2× step between adjacent hierarchy scales stays one Mallat octave (signature upsample).
+ * Detail subbands are retained on each scale and steer the next finer observation.
+ * hierarchy_collapse requires spectral fields: the residual is a signature target.
+ * Observe order is the Shannon entropy of the Gaussian-reweighted posterior, and pattern
+ * choice samples that posterior. Without spectral the call returns WFC_EUNINIT.
+ * set_mode: 0 = coarse-to-fine generation (default), 1 = fine-to-coarse analysis.
+ * residual_energy is the L2 of the detail samples stored at that level (0 if level is out of range).
+ * adopt_spectral copies the live fBm/Matérn field and decomposes it once into the
+ * detail buffers. That split is z^(0). A spectral field is not a target until
+ * this call or set_target. set_wavelet and set_target drop a previous split. */
 #if defined(WFC_ENABLE_HIERARCHY)
 wfc_err_t wfc_hierarchy_init(wfc_world_t* w, uint32_t nlevels);
 wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_levels);
 wfc_err_t wfc_hierarchy_set_target(wfc_world_t* w, const float* target, uint32_t count);
+wfc_err_t wfc_hierarchy_adopt_spectral(wfc_world_t* w);
+wfc_err_t wfc_hierarchy_set_mode(wfc_world_t* w, int mode);
+float     wfc_hierarchy_residual_energy(const wfc_world_t* w, uint32_t level);
 wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w);
 void      wfc_hierarchy_destroy(wfc_world_t* w);
 #endif
@@ -1221,13 +1253,89 @@ static inline void wfc_gumbel_link_f(float* buf, int n)
     }
 }
 
+/* n >= 128 makes FAF spawn gcc for a JIT kernel on first execute.
+ * Worlds used to build that kernel and throw it away. The cache keeps the
+ * pair for the process. A full cache returns a private plan the caller frees. */
+typedef struct wfc_faf_plan_slot {
+    int used;
+    int family;
+    uint32_t n;
+    uint32_t levels;
+    faf_transform* fwd;
+    faf_transform* inv;
+} wfc_faf_plan_slot;
+
+static wfc_faf_plan_slot wfc_faf_plans[16];
+
+static int wfc_faf_acquire_plan(int family, uint32_t n, uint32_t levels,
+                                faf_transform** fwd, faf_transform** inv, int* shared)
+{
+    int i;
+    *fwd = NULL;
+    *inv = NULL;
+    *shared = 0;
+    if (n == 0) return -1;
+    for (i = 0; i < 16; ++i) {
+        wfc_faf_plan_slot* s = &wfc_faf_plans[i];
+        if (s->used && s->family == family && s->n == n && s->levels == levels) {
+            *fwd = s->fwd;
+            *inv = s->inv;
+            *shared = 1;
+            return 0;
+        }
+    }
+    faf_init();
+    faf_config rc = faf_config_init(n);
+    rc.family = (faf_wavelet_family)family;
+    rc.levels = levels;
+    rc.layout = FAF_LAYOUT_INTERLEAVED;
+    {
+        faf_transform* created = faf_create_dwt(&rc);
+        faf_transform* inverse;
+        if (!created) return -1;
+        inverse = faf_create_inverse(created);
+        if (!inverse) {
+            faf_destroy_transform(created);
+            return -1;
+        }
+        for (i = 0; i < 16; ++i) {
+            if (!wfc_faf_plans[i].used) {
+                wfc_faf_plans[i].used = 1;
+                wfc_faf_plans[i].family = family;
+                wfc_faf_plans[i].n = n;
+                wfc_faf_plans[i].levels = levels;
+                wfc_faf_plans[i].fwd = created;
+                wfc_faf_plans[i].inv = inverse;
+                *fwd = created;
+                *inv = inverse;
+                *shared = 1;
+                return 0;
+            }
+        }
+        *fwd = created;
+        *inv = inverse;
+        *shared = 0;
+    }
+    return 0;
+}
+
 static inline void wfc_faf_teardown_transforms(wfc_world_t* w)
 {
     if (!w) return;
-    if (w->faf_row_fwd) { faf_destroy_transform(w->faf_row_fwd); w->faf_row_fwd = NULL; }
-    if (w->faf_row_inv) { faf_destroy_transform(w->faf_row_inv); w->faf_row_inv = NULL; }
-    if (w->faf_col_fwd) { faf_destroy_transform(w->faf_col_fwd); w->faf_col_fwd = NULL; }
-    if (w->faf_col_inv) { faf_destroy_transform(w->faf_col_inv); w->faf_col_inv = NULL; }
+    if (!w->faf_row_shared) {
+        if (w->faf_row_inv) faf_destroy_transform(w->faf_row_inv);
+        if (w->faf_row_fwd) faf_destroy_transform(w->faf_row_fwd);
+    }
+    w->faf_row_fwd = NULL;
+    w->faf_row_inv = NULL;
+    if (!w->faf_col_shared) {
+        if (w->faf_col_inv) faf_destroy_transform(w->faf_col_inv);
+        if (w->faf_col_fwd) faf_destroy_transform(w->faf_col_fwd);
+    }
+    w->faf_col_fwd = NULL;
+    w->faf_col_inv = NULL;
+    w->faf_row_shared = 0;
+    w->faf_col_shared = 0;
     if (w->faf_workspace) { faf_aligned_free(w->faf_workspace); w->faf_workspace = NULL; }
     if (w->faf_col_buf) { faf_aligned_free(w->faf_col_buf); w->faf_col_buf = NULL; }
     w->faf_initialized = 0;
@@ -1251,30 +1359,34 @@ static inline wfc_err_t wfc_faf_ensure_transforms(wfc_world_t* w)
     }
 
     int family = w->faf_wavelet_family;
+    int row_shared = 0, col_shared = 0;
     if (family < 0 || family >= (int)FAF_WAVELET_COUNT)
         family = (int)FAF_WAVELET_CDF97;
 
-    faf_config rc = faf_config_init(nx);
-    rc.family   = (faf_wavelet_family)family;
-    rc.levels   = levels_row;
-    rc.layout   = FAF_LAYOUT_INTERLEAVED;
-    w->faf_row_fwd = faf_create_dwt(&rc);
-    if (!w->faf_row_fwd) return WFC_ENOMEM;
-    w->faf_row_inv = faf_create_inverse(w->faf_row_fwd);
-    if (!w->faf_row_inv) return WFC_ENOMEM;
-
-    faf_config cc = faf_config_init(ny);
-    cc.family   = (faf_wavelet_family)family;
-    cc.levels   = levels_col;
-    cc.layout   = FAF_LAYOUT_INTERLEAVED;
-    w->faf_col_fwd = faf_create_dwt(&cc);
-    if (!w->faf_col_fwd) return WFC_ENOMEM;
-    w->faf_col_inv = faf_create_inverse(w->faf_col_fwd);
-    if (!w->faf_col_inv) return WFC_ENOMEM;
+    w->faf_row_shared = 0;
+    w->faf_col_shared = 0;
+    if (wfc_faf_acquire_plan(family, nx, (uint32_t)levels_row,
+                             &w->faf_row_fwd, &w->faf_row_inv, &row_shared) != 0)
+        return WFC_ENOMEM;
+    w->faf_row_shared = row_shared;
+    if (nx == ny && levels_row == levels_col) {
+        w->faf_col_fwd = w->faf_row_fwd;
+        w->faf_col_inv = w->faf_row_inv;
+        w->faf_col_shared = 1;
+    } else if (wfc_faf_acquire_plan(family, ny, (uint32_t)levels_col,
+                                    &w->faf_col_fwd, &w->faf_col_inv, &col_shared) != 0) {
+        wfc_faf_teardown_transforms(w);
+        return WFC_ENOMEM;
+    } else {
+        w->faf_col_shared = col_shared;
+    }
 
     w->faf_workspace = (float*)faf_aligned_alloc(2 * (size_t)nx * ny * sizeof(float));
     w->faf_col_buf   = (float*)faf_aligned_alloc(2 * (size_t)max_dim * sizeof(float));
-    if (!w->faf_workspace || !w->faf_col_buf) return WFC_ENOMEM;
+    if (!w->faf_workspace || !w->faf_col_buf) {
+        wfc_faf_teardown_transforms(w);
+        return WFC_ENOMEM;
+    }
 
     w->faf_initialized = 1;
     w->faf_live_family = family;
@@ -1935,6 +2047,26 @@ static inline wfc_err_t wfc_collapse_one(wfc_world_t* w, uint32_t* out_cell_idx)
     return WFC_OK;
 }
 
+/* Two pinned cells that share an edge must name a legal pair. Propagation
+ * does not rewrite a collapsed neighbor, so the domain pass cannot see this. */
+static int wfc_fixed_neighbors_ok(const wfc_world_t* w, uint32_t cell_idx)
+{
+    const wfc_cell_t* cell = &w->cells[cell_idx];
+    uint16_t pat = cell->collapsed;
+    if (pat == WFC_PATTERN_INVALID || pat >= WFC_MAX_PATTERNS) return 1;
+    int nd = w->is_3d ? 6 : 4;
+    for (int d = 0; d < nd; ++d) {
+        uint32_t nidx;
+        uint16_t np;
+        if (!wfc_neighbor_index(w, cell_idx, (wfc_dir_t)d, &nidx)) continue;
+        np = w->cells[nidx].collapsed;
+        if (np == WFC_PATTERN_INVALID || np >= WFC_MAX_PATTERNS) continue;
+        if ((w->compat[d][pat][np >> 6] & (UINT64_C(1) << (np & 63))) == 0)
+            return 0;
+    }
+    return 1;
+}
+
 /* Intersect the support, run AC-3 to a fixpoint, then write true entropies.
  * The heap is built by the caller from those entropies. */
 static wfc_err_t wfc_prepare_fail(wfc_world_t* w, uint32_t cell_idx)
@@ -1955,6 +2087,17 @@ static wfc_err_t wfc_solver_prepare(wfc_world_t* w)
     for (uint32_t i = 0; i < w->num_cells; ++i)
         w->heap_pos[i] = WFC_HEAP_INVALID;
 
+    /* Recount from the grid. wfc_fix_cell increments as it pins, and a
+     * second prepare (or a reset) must not add those cells again. */
+    memset(w->class_placed, 0, sizeof(w->class_placed));
+    for (uint32_t i = 0; i < w->num_cells; ++i) {
+        uint16_t pat;
+        if (!wfc_cell_logical(w, i)) continue;
+        pat = w->cells[i].collapsed;
+        if (pat != WFC_PATTERN_INVALID && pat < w->num_patterns)
+            wfc_note_class_placed(w, pat, 1);
+    }
+
 #if defined(WFC_ENABLE_BACKTRACK)
     w->contradiction = 0;
 #endif
@@ -1973,9 +2116,10 @@ static wfc_err_t wfc_solver_prepare(wfc_world_t* w)
 
     w->queue_head = w->queue_tail = 0;
     if (w->in_queue) memset(w->in_queue, 0, (size_t)w->num_cells * sizeof(uint8_t));
+    /* Pinned cells are unary constraints. They have to enter the queue or
+     * their compat row never reaches an open neighbor. */
     for (uint32_t i = 0; i < w->num_cells; ++i) {
         if (!wfc_cell_logical(w, i)) continue;
-        if (w->cells[i].collapsed != WFC_PATTERN_INVALID) continue;
         wfc_queue_push(w, i);
     }
     while (w->queue_head != w->queue_tail) {
@@ -1985,6 +2129,12 @@ static wfc_err_t wfc_solver_prepare(wfc_world_t* w)
 #if defined(WFC_ENABLE_BACKTRACK)
         if (w->contradiction) return wfc_prepare_fail(w, cur);
 #endif
+    }
+
+    for (uint32_t i = 0; i < w->num_cells; ++i) {
+        if (!wfc_cell_logical(w, i)) continue;
+        if (w->cells[i].collapsed == WFC_PATTERN_INVALID) continue;
+        if (!wfc_fixed_neighbors_ok(w, i)) return wfc_prepare_fail(w, i);
     }
 
     for (uint32_t i = 0; i < w->num_cells; ++i) {
@@ -2182,6 +2332,8 @@ wfc_world_t* wfc_world_create(const wfc_config_t* cfg)
     w->faf_wavelet_family = FAF_WAVELET_CDF97;
     w->faf_wavelet_levels = 0;
     w->faf_live_family = 0;
+    w->faf_row_shared = 0;
+    w->faf_col_shared = 0;
     w->spectral_guides_choice = 0;
 #endif
 
@@ -2292,6 +2444,24 @@ wfc_err_t wfc_set_class_limit(wfc_world_t* w, uint16_t class_id, uint32_t min_co
         w->class_constrained |= wfc_class_bit(class_id);
     else
         w->class_constrained &= ~wfc_class_bit(class_id);
+    return WFC_OK;
+}
+
+wfc_err_t wfc_fix_cell(wfc_world_t* w, uint32_t x, uint32_t y, uint32_t z, uint16_t pat)
+{
+    wfc_cell_t* cell;
+    uint32_t idx;
+    if (!w || pat >= w->num_patterns || pat >= WFC_MAX_PATTERNS) return WFC_EINVAL;
+    if (x >= w->nx || y >= w->ny || z >= w->nz) return WFC_EINVAL;
+    idx = wfc_idx(w, x, y, z);
+    cell = &w->cells[idx];
+    if (cell->collapsed != WFC_PATTERN_INVALID) return WFC_EINVAL;
+    wfc_mask_clear(cell->mask);
+    cell->mask[pat >> 6] |= (UINT64_C(1) << (pat & 63));
+    cell->collapsed = pat;
+    cell->entropy = -1.0f;
+    cell->dirty = 0;
+    wfc_note_class_placed(w, pat, 1);
     return WFC_OK;
 }
 
@@ -2531,17 +2701,38 @@ wfc_err_t wfc_hierarchy_init(wfc_world_t* w, uint32_t nlevels)
         s->residual_field = (float*)faf_aligned_alloc(s->ncells * sizeof(float));
         s->recon_field    = (float*)faf_aligned_alloc(s->ncells * sizeof(float));
         s->coarse_codes   = (uint16_t*)faf_aligned_alloc(s->ncells * sizeof(uint16_t));
-        if (!s->residual_field || !s->recon_field || !s->coarse_codes) {
+        s->detail_pack    = (float*)faf_aligned_alloc(s->ncells * sizeof(float));
+        s->detail_cap     = s->detail_pack ? s->ncells : 0;
+        if (!s->residual_field || !s->recon_field || !s->coarse_codes || !s->detail_pack) {
             wfc_hierarchy_destroy(w);
             return WFC_ENOMEM;
         }
         memset(s->residual_field, 0, s->ncells * sizeof(float));
         memset(s->recon_field, 0, s->ncells * sizeof(float));
+        memset(s->detail_pack, 0, s->ncells * sizeof(float));
         for (uint32_t i = 0; i < s->ncells; ++i)
             s->coarse_codes[i] = WFC_PATTERN_INVALID;
     }
 
     return WFC_OK;
+}
+
+/* A new family, depth, or target makes the stored Mallat split stale. */
+static void wfc_hierarchy_invalidate(wfc_hierarchy_t* h)
+{
+    uint32_t k;
+    if (!h) return;
+    h->decomposed = 0;
+    if (!h->levels) return;
+    for (k = 0; k < h->nlevels; ++k) {
+        wfc_scale_t* s = &h->levels[k];
+        s->detail_lh = NULL;
+        s->detail_hl = NULL;
+        s->detail_hh = NULL;
+        s->detail_count = 0;
+        s->octave_lo = 0;
+        s->octave_hi = 0;
+    }
 }
 
 wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_levels)
@@ -2550,10 +2741,11 @@ wfc_err_t wfc_hierarchy_set_wavelet(wfc_world_t* w, int family, uint32_t dwt_lev
     if (family < 0 || family >= (int)FAF_WAVELET_COUNT) return WFC_EINVAL;
     w->hierarchy->wavelet_family = family;
     w->hierarchy->wavelet_levels = dwt_levels;
+    wfc_hierarchy_invalidate(w->hierarchy);
 
-    /* Family drives spectral DWT synthesis; dwt_levels caps decomposition
-     * depth. Tear down existing plans so the next field rebuilds instead
-     * of silently keeping the old wavelet. */
+    /* Family drives spectral synthesis and the residual DWT. dwt_levels is
+     * the residual depth (0 = every octave). Tear plans down so the next
+     * transform is built at that depth instead of keeping the old wavelet. */
     w->faf_wavelet_family = family;
     w->faf_wavelet_levels = dwt_levels;
     if (w->faf_initialized)
@@ -2571,7 +2763,29 @@ wfc_err_t wfc_hierarchy_set_target(wfc_world_t* w, const float* target, uint32_t
         if (!w->hierarchy->target_field) return WFC_ENOMEM;
     }
     memcpy(w->hierarchy->target_field, target, count * sizeof(float));
+    wfc_hierarchy_invalidate(w->hierarchy);
     return WFC_OK;
+}
+
+wfc_err_t wfc_hierarchy_set_mode(wfc_world_t* w, int mode)
+{
+    if (!w || !w->hierarchy) return WFC_EUNINIT;
+    if (mode != 0 && mode != 1) return WFC_EINVAL;
+    w->hierarchy->mode = mode;
+    return WFC_OK;
+}
+
+float wfc_hierarchy_residual_energy(const wfc_world_t* w, uint32_t level)
+{
+    if (!w || !w->hierarchy || level >= w->hierarchy->nlevels) return 0.0f;
+    const wfc_scale_t* s = &w->hierarchy->levels[level];
+    if (!s->detail_pack || s->detail_count == 0) return 0.0f;
+    double acc = 0.0;
+    for (uint32_t i = 0; i < s->detail_count; ++i) {
+        double v = (double)s->detail_pack[i];
+        acc += v * v;
+    }
+    return (float)sqrt(acc);
 }
 
 /* Create a temporary world at a given scale that shares pattern/compat data */
@@ -2612,8 +2826,10 @@ static wfc_world_t* wfc_hierarchy_create_level_world(wfc_world_t* parent, const 
     return lw;
 }
 
-/* 1-level inverse DWT: Mallat LL holds `src` (cnx×cny), details are zero.
- * Family (Haar vs CDF 9/7) shapes the 2× synthesis. */
+/* 1-level inverse DWT: Mallat LL holds `src`, details are zero.
+ * This is the single octave between two adjacent hierarchy scales (2×).
+ * Residual depth is h->wavelet_levels, not this step. Family shapes the synthesis:
+ * Haar is piecewise-constant 2×2, CDF 9/7 interpolates. */
 static wfc_err_t wfc_hierarchy_dwt_synthesize(wfc_world_t* lw,
                                               const float* WFC_RESTRICT src,
                                               uint32_t snx, uint32_t sny,
@@ -2656,49 +2872,511 @@ static wfc_err_t wfc_hierarchy_dwt_synthesize(wfc_world_t* lw,
     return WFC_OK;
 }
 
-/* 1-level forward DWT, drop LH/HL/HH, inverse: family-dependent low-pass. */
-static wfc_err_t wfc_hierarchy_dwt_lowpass(wfc_world_t* lw,
-                                           float* WFC_RESTRICT field,
-                                           uint32_t fnx, uint32_t fny)
+static uint32_t wfc_hierarchy_full_depth(uint32_t nx, uint32_t ny)
 {
-    uint32_t saved = lw->faf_wavelet_levels;
-    lw->faf_wavelet_levels = 1;
-    if (lw->faf_initialized) wfc_faf_teardown_transforms(lw);
-    wfc_err_t err = wfc_faf_ensure_transforms(lw);
+    uint32_t m = nx < ny ? nx : ny;
+    uint32_t d = 0;
+    while (m > 1) { m >>= 1; ++d; }
+    return d;
+}
+
+static uint32_t wfc_hierarchy_analysis_depth(const wfc_hierarchy_t* h, uint32_t nx, uint32_t ny)
+{
+    uint32_t full = wfc_hierarchy_full_depth(nx, ny);
+    if (full == 0) return 0;
+    uint32_t d = (h->wavelet_levels == 0) ? full : h->wavelet_levels;
+    if (d > full) d = full;
+    return d;
+}
+
+static double wfc_hierarchy_octave_ss(const float* coeff, uint32_t nx, uint32_t ny, uint32_t j)
+{
+    uint32_t hx = (nx >> j) >> 1;
+    uint32_t hy = (ny >> j) >> 1;
+    double acc = 0.0;
+    if (hx == 0 || hy == 0) return 0.0;
+    for (uint32_t r = 0; r < hy; ++r) {
+        for (uint32_t c = 0; c < hx; ++c) {
+            double lh = coeff[(size_t)r * 2u * nx + 2u * (hx + c)];
+            double hl = coeff[(size_t)(hy + r) * 2u * nx + 2u * c];
+            double hh = coeff[(size_t)(hy + r) * 2u * nx + 2u * (hx + c)];
+            acc += lh * lh + hl * hl + hh * hh;
+        }
+    }
+    return acc;
+}
+
+static double wfc_hierarchy_range_ss(const double* ss, uint32_t lo, uint32_t hi)
+{
+    double acc = 0.0;
+    for (uint32_t j = lo; j < hi; ++j) acc += ss[j];
+    return acc;
+}
+
+/* Octave 0 is the finest Mallat band. Level 0 is the coarsest WFC scale.
+ * A shallow depth fills the finest levels first. When there are more octaves
+ * than levels, extra fine bands start on the finest level and move onto the
+ * next coarser level until each level's detail energy is below the one
+ * before it. That keeps nlevels in the partition: fewer levels leave a
+ * larger pack on the finest scale. */
+static void wfc_hierarchy_assign_octaves(uint32_t nlevels, uint32_t depth,
+                                         const double* ss, uint32_t* lo, uint32_t* hi)
+{
+    for (uint32_t level = 0; level < nlevels; ++level) lo[level] = hi[level] = 0;
+    if (depth == 0) return;
+    if (depth < nlevels) {
+        for (uint32_t i = 0; i < depth; ++i) {
+            uint32_t level = nlevels - 1u - i;
+            lo[level] = i;
+            hi[level] = i + 1u;
+        }
+        return;
+    }
+    for (uint32_t level = 0; level + 1u < nlevels; ++level) {
+        uint32_t octave = (depth - 1u) - level;
+        lo[level] = octave;
+        hi[level] = octave + 1u;
+    }
+    lo[nlevels - 1u] = 0;
+    hi[nlevels - 1u] = depth - (nlevels - 1u);
+
+    for (;;) {
+        int moved = 0;
+        for (uint32_t level = nlevels - 1u; level > 0; --level) {
+            if (hi[level] <= lo[level] + 1u) continue;
+            if (lo[level - 1u] == 0 || lo[level - 1u] != hi[level]) continue;
+            if (wfc_hierarchy_range_ss(ss, lo[level], hi[level])
+                < wfc_hierarchy_range_ss(ss, lo[level - 1u], hi[level - 1u]))
+                continue;
+            hi[level] -= 1u;
+            lo[level - 1u] -= 1u;
+            moved = 1;
+        }
+        if (!moved) break;
+    }
+}
+
+static uint32_t wfc_hierarchy_octave_samples(uint32_t nx, uint32_t ny, uint32_t j)
+{
+    uint32_t bx = nx >> j;
+    uint32_t by = ny >> j;
+    if (bx < 2 || by < 2) return 0;
+    return 3u * (bx >> 1) * (by >> 1);
+}
+
+static void wfc_hierarchy_copy_octave(const float* coeff, uint32_t nx, uint32_t ny,
+                                      uint32_t j, float* dst)
+{
+    uint32_t hx = (nx >> j) >> 1;
+    uint32_t hy = (ny >> j) >> 1;
+    float* lh = dst;
+    float* hl = lh + (size_t)hx * hy;
+    float* hh = hl + (size_t)hx * hy;
+    for (uint32_t r = 0; r < hy; ++r) {
+        for (uint32_t c = 0; c < hx; ++c) {
+            lh[(size_t)r * hx + c] = coeff[(size_t)r * 2u * nx + 2u * (hx + c)];
+            hl[(size_t)r * hx + c] = coeff[(size_t)(hy + r) * 2u * nx + 2u * c];
+            hh[(size_t)r * hx + c] = coeff[(size_t)(hy + r) * 2u * nx + 2u * (hx + c)];
+        }
+    }
+}
+
+static void wfc_hierarchy_scatter_octave(float* coeff, uint32_t nx, uint32_t ny,
+                                         uint32_t j, const float* src)
+{
+    uint32_t hx = (nx >> j) >> 1;
+    uint32_t hy = (ny >> j) >> 1;
+    const float* lh = src;
+    const float* hl = lh + (size_t)hx * hy;
+    const float* hh = hl + (size_t)hx * hy;
+    for (uint32_t r = 0; r < hy; ++r) {
+        for (uint32_t c = 0; c < hx; ++c) {
+            size_t i_lh = (size_t)r * 2u * nx + 2u * (hx + c);
+            size_t i_hl = (size_t)(hy + r) * 2u * nx + 2u * c;
+            size_t i_hh = (size_t)(hy + r) * 2u * nx + 2u * (hx + c);
+            coeff[i_lh]     = lh[(size_t)r * hx + c];
+            coeff[i_lh + 1] = 0.0f;
+            coeff[i_hl]     = hl[(size_t)r * hx + c];
+            coeff[i_hl + 1] = 0.0f;
+            coeff[i_hh]     = hh[(size_t)r * hx + c];
+            coeff[i_hh + 1] = 0.0f;
+        }
+    }
+}
+
+static wfc_err_t wfc_hierarchy_grow_pack(wfc_scale_t* s, uint32_t need)
+{
+    if (need <= s->detail_cap && s->detail_pack) return WFC_OK;
+    if (need == 0) return WFC_OK;
+    float* p = (float*)faf_aligned_alloc((size_t)need * sizeof(float));
+    if (!p) return WFC_ENOMEM;
+    faf_aligned_free(s->detail_pack);
+    s->detail_pack = p;
+    s->detail_cap = need;
+    s->detail_lh = s->detail_hl = s->detail_hh = NULL;
+    return WFC_OK;
+}
+
+static wfc_err_t wfc_hierarchy_extract(wfc_hierarchy_t* h, const float* coeff,
+                                       uint32_t nx, uint32_t ny, uint32_t depth)
+{
+    double* ss = (double*)WFC_MALLOC((size_t)depth * sizeof(double));
+    uint32_t* lo = (uint32_t*)WFC_MALLOC((size_t)h->nlevels * sizeof(uint32_t));
+    uint32_t* hi = (uint32_t*)WFC_MALLOC((size_t)h->nlevels * sizeof(uint32_t));
+    if (!ss || !lo || !hi || depth == 0) {
+        WFC_FREE(ss);
+        WFC_FREE(lo);
+        WFC_FREE(hi);
+        return depth == 0 ? WFC_EINVAL : WFC_ENOMEM;
+    }
+    for (uint32_t j = 0; j < depth; ++j)
+        ss[j] = wfc_hierarchy_octave_ss(coeff, nx, ny, j);
+    wfc_hierarchy_assign_octaves(h->nlevels, depth, ss, lo, hi);
+    WFC_FREE(ss);
+
+    for (uint32_t level = 0; level < h->nlevels; ++level) {
+        wfc_scale_t* s = &h->levels[level];
+        uint32_t need = 0;
+        for (uint32_t j = lo[level]; j < hi[level]; ++j)
+            need += wfc_hierarchy_octave_samples(nx, ny, j);
+        wfc_err_t err = wfc_hierarchy_grow_pack(s, need);
+        if (err != WFC_OK) {
+            WFC_FREE(lo);
+            WFC_FREE(hi);
+            return err;
+        }
+        s->octave_lo = lo[level];
+        s->octave_hi = hi[level];
+        s->detail_count = need;
+        s->detail_lh = s->detail_hl = s->detail_hh = NULL;
+        if (need == 0) continue;
+        uint32_t off = 0;
+        for (uint32_t j = lo[level]; j < hi[level]; ++j) {
+            uint32_t n = wfc_hierarchy_octave_samples(nx, ny, j);
+            if (n == 0) continue;
+            wfc_hierarchy_copy_octave(coeff, nx, ny, j, s->detail_pack + off);
+            /* First owned octave is the view. Its plane is (nx>>j)/2 by (ny>>j)/2,
+             * which is this scale's half-resolution band when the level owns that octave. */
+            if (!s->detail_lh) {
+                uint32_t hx = (nx >> j) >> 1;
+                uint32_t hy = (ny >> j) >> 1;
+                s->detail_lh = s->detail_pack + off;
+                s->detail_hl = s->detail_lh + (size_t)hx * hy;
+                s->detail_hh = s->detail_hl + (size_t)hx * hy;
+            }
+            off += n;
+        }
+    }
+    WFC_FREE(lo);
+    WFC_FREE(hi);
+    return WFC_OK;
+}
+
+static wfc_err_t wfc_hierarchy_bind_depth(wfc_world_t* w, uint32_t depth)
+{
+    if (w->faf_initialized) wfc_faf_teardown_transforms(w);
+    w->faf_wavelet_levels = depth;
+    wfc_err_t err = wfc_faf_ensure_transforms(w);
+    if (err != WFC_OK) wfc_faf_teardown_transforms(w);
+    return err;
+}
+
+static void wfc_hierarchy_unbind(wfc_world_t* w, uint32_t saved_levels)
+{
+    wfc_faf_teardown_transforms(w);
+    w->faf_wavelet_levels = saved_levels;
+}
+
+/* Inverse of `scale`'s stored detail octaves. LL and every other band stay zero.
+ * `w` must already hold a forward/inverse pair built at the analysis depth. */
+static wfc_err_t wfc_hierarchy_synth_pack(wfc_world_t* w, const wfc_scale_t* scale,
+                                          uint32_t nx, uint32_t ny, float* full_out)
+{
+    uint32_t nxy = nx * ny;
+    if (!scale->detail_pack || scale->detail_count == 0 || scale->octave_lo == scale->octave_hi) {
+        memset(full_out, 0, (size_t)nxy * sizeof(float));
+        return WFC_OK;
+    }
+    float* buf = (float*)faf_aligned_alloc(2u * (size_t)nxy * sizeof(float));
+    if (!buf) return WFC_ENOMEM;
+    memset(buf, 0, 2u * (size_t)nxy * sizeof(float));
+    uint32_t off = 0;
+    for (uint32_t j = scale->octave_lo; j < scale->octave_hi; ++j) {
+        uint32_t n = wfc_hierarchy_octave_samples(nx, ny, j);
+        if (n == 0) continue;
+        wfc_hierarchy_scatter_octave(buf, nx, ny, j, scale->detail_pack + off);
+        off += n;
+    }
+    wfc_faf_dwt_2d_inverse(w, buf);
+    for (uint32_t i = 0; i < nxy; ++i) full_out[i] = buf[2u * i];
+    faf_aligned_free(buf);
+    return WFC_OK;
+}
+
+/* Family-dependent low-pass: inverse of the deepest LL, details discarded
+ * from this reconstruction only. The detail samples already live on the scales. */
+static wfc_err_t wfc_hierarchy_store_lowpass(wfc_world_t* w, const float* coeff,
+                                             uint32_t nx, uint32_t ny, uint32_t depth)
+{
+    uint32_t nxy = nx * ny;
+    float* buf = (float*)faf_aligned_alloc(2u * (size_t)nxy * sizeof(float));
+    if (!buf) return WFC_ENOMEM;
+    memcpy(buf, coeff, 2u * (size_t)nxy * sizeof(float));
+    uint32_t llx = nx >> depth;
+    uint32_t lly = ny >> depth;
+    if (llx == 0) llx = 1;
+    if (lly == 0) lly = 1;
+    for (uint32_t y = 0; y < ny; ++y) {
+        for (uint32_t x = 0; x < nx; ++x) {
+            if (y >= lly || x >= llx) {
+                buf[2u * ((size_t)y * nx + x)] = 0.0f;
+                buf[2u * ((size_t)y * nx + x) + 1] = 0.0f;
+            }
+        }
+    }
+    wfc_faf_dwt_2d_inverse(w, buf);
+    float* spatial = (float*)faf_aligned_alloc((size_t)nxy * sizeof(float));
+    if (!spatial) { faf_aligned_free(buf); return WFC_ENOMEM; }
+    for (uint32_t i = 0; i < nxy; ++i) spatial[i] = buf[2u * i];
+    faf_aligned_free(buf);
+    wfc_scale_t* coarse = &w->hierarchy->levels[0];
+    wfc_hierarchy_project_target(w, spatial, coarse->nx, coarse->ny, coarse->residual_field);
+    faf_aligned_free(spatial);
+    return WFC_OK;
+}
+
+static wfc_err_t wfc_hierarchy_analyze(wfc_world_t* w)
+{
+    wfc_hierarchy_t* h = w->hierarchy;
+    uint32_t nx = w->nx_p2, ny = w->ny_p2;
+    uint32_t nxy = nx * ny;
+    uint32_t depth = wfc_hierarchy_analysis_depth(h, nx, ny);
+    if (depth == 0 || nxy == 0 || w->num_cells < nxy) return WFC_EINVAL;
+
+    if (!h->running) {
+        h->running = (float*)faf_aligned_alloc((size_t)w->num_cells * sizeof(float));
+        if (!h->running) return WFC_ENOMEM;
+    }
+    memcpy(h->running, h->target_field, (size_t)w->num_cells * sizeof(float));
+
+    uint32_t saved = w->faf_wavelet_levels;
+    w->faf_wavelet_family = h->wavelet_family;
+    wfc_err_t err = wfc_hierarchy_bind_depth(w, depth);
     if (err != WFC_OK) {
-        lw->faf_wavelet_levels = saved;
+        wfc_hierarchy_unbind(w, saved);
         return err;
     }
 
-    uint32_t nx = lw->nx_p2, ny = lw->ny_p2;
-    size_t n = 2u * (size_t)nx * (size_t)ny;
-    float* buf = (float*)faf_aligned_alloc(n * sizeof(float));
+    float* buf = (float*)faf_aligned_alloc(2u * (size_t)nxy * sizeof(float));
     if (!buf) {
-        lw->faf_wavelet_levels = saved;
+        wfc_hierarchy_unbind(w, saved);
         return WFC_ENOMEM;
     }
-    memset(buf, 0, n * sizeof(float));
-    for (uint32_t y = 0; y < fny && y < ny; ++y)
-        for (uint32_t x = 0; x < fnx && x < nx; ++x)
-            buf[2 * (y * nx + x)] = field[y * fnx + x];
+    memset(buf, 0, 2u * (size_t)nxy * sizeof(float));
+    for (uint32_t i = 0; i < nxy; ++i) buf[2u * i] = h->target_field[i];
 
-    wfc_faf_dwt_2d_forward(lw, buf);
-    uint32_t hx = nx / 2, hy = ny / 2;
-    for (uint32_t y = 0; y < ny; ++y) {
-        for (uint32_t x = 0; x < nx; ++x) {
-            if (y >= hy || x >= hx)
-                buf[2 * (y * nx + x)] = buf[2 * (y * nx + x) + 1] = 0.0f;
+    wfc_faf_dwt_2d_forward(w, buf);
+    err = wfc_hierarchy_extract(h, buf, nx, ny, depth);
+    if (err == WFC_OK)
+        err = wfc_hierarchy_store_lowpass(w, buf, nx, ny, depth);
+    faf_aligned_free(buf);
+    wfc_hierarchy_unbind(w, saved);
+    return err;
+}
+
+/* Snapshot the generated fBm/Matérn field and split it once. Later collapse
+ * reuses that Mallat packing and only restores the running residual. */
+wfc_err_t wfc_hierarchy_adopt_spectral(wfc_world_t* w)
+{
+    wfc_err_t err;
+    if (!w || !w->hierarchy) return WFC_EUNINIT;
+    if (!w->spectral_enabled || !w->spectral_field) return WFC_EUNINIT;
+    err = wfc_hierarchy_set_target(w, w->spectral_field, w->num_cells);
+    if (err != WFC_OK) return err;
+    err = wfc_hierarchy_analyze(w);
+    if (err != WFC_OK) return err;
+    w->hierarchy->decomposed = 1;
+    return WFC_OK;
+}
+
+/* 1-level inverse on an interleaved buffer. Serial, so it matches the
+ * level-world upsample on grids that do not take the parallel path. */
+static wfc_err_t wfc_hierarchy_idwt_1level(int family, float* data, uint32_t nx, uint32_t ny)
+{
+    faf_transform* row_fwd = NULL;
+    faf_transform* row_inv = NULL;
+    faf_transform* col_fwd = NULL;
+    faf_transform* col_inv = NULL;
+    int row_shared = 0, col_shared = 0;
+    float* ws = NULL;
+    float* col = NULL;
+    wfc_err_t err = WFC_OK;
+    if (wfc_faf_acquire_plan(family, nx, 1, &row_fwd, &row_inv, &row_shared) != 0)
+        return WFC_ENOMEM;
+    if (ny == nx) {
+        col_fwd = row_fwd;
+        col_inv = row_inv;
+        col_shared = 1;
+    } else if (wfc_faf_acquire_plan(family, ny, 1, &col_fwd, &col_inv, &col_shared) != 0) {
+        if (!row_shared) {
+            faf_destroy_transform(row_inv);
+            faf_destroy_transform(row_fwd);
+        }
+        return WFC_ENOMEM;
+    }
+
+    ws = (float*)faf_aligned_alloc(2u * (size_t)nx * ny * sizeof(float));
+    col = (float*)faf_aligned_alloc(2u * (size_t)(nx > ny ? nx : ny) * sizeof(float));
+    if (!ws || !col) { err = WFC_ENOMEM; goto done; }
+
+    for (uint32_t i = 0; i < nx; ++i) {
+        for (uint32_t j = 0; j < ny; ++j) {
+            col[2u * j]     = data[(size_t)j * 2u * nx + 2u * i];
+            col[2u * j + 1] = data[(size_t)j * 2u * nx + 2u * i + 1];
+        }
+        faf_execute_f32(col_inv, ws, col);
+        for (uint32_t j = 0; j < ny; ++j) {
+            data[(size_t)j * 2u * nx + 2u * i]     = ws[2u * j];
+            data[(size_t)j * 2u * nx + 2u * i + 1] = ws[2u * j + 1];
         }
     }
-    wfc_faf_dwt_2d_inverse(lw, buf);
+    for (uint32_t j = 0; j < ny; ++j) {
+        float* row = data + (size_t)j * 2u * nx;
+        faf_execute_f32(row_inv, ws + (size_t)j * 2u * nx, row);
+    }
+    memcpy(data, ws, 2u * (size_t)nx * ny * sizeof(float));
 
-    for (uint32_t y = 0; y < fny && y < ny; ++y)
-        for (uint32_t x = 0; x < fnx && x < nx; ++x)
-            field[y * fnx + x] = buf[2 * (y * nx + x)];
+done:
+    faf_aligned_free(ws);
+    faf_aligned_free(col);
+    if (!row_shared) {
+        if (row_inv) faf_destroy_transform(row_inv);
+        if (row_fwd) faf_destroy_transform(row_fwd);
+    }
+    if (!col_shared) {
+        if (col_inv) faf_destroy_transform(col_inv);
+        if (col_fwd) faf_destroy_transform(col_fwd);
+    }
+    return err;
+}
 
-    faf_aligned_free(buf);
-    lw->faf_wavelet_levels = saved;
-    wfc_faf_teardown_transforms(lw);
+static wfc_err_t wfc_hierarchy_expand_sig(int family, const float* sig,
+                                          uint32_t snx, uint32_t sny,
+                                          float* dst, uint32_t dnx, uint32_t dny)
+{
+    if (snx == 0 || sny == 0 || dnx == 0 || dny == 0) return WFC_EINVAL;
+    float* cur = (float*)faf_aligned_alloc((size_t)snx * sny * sizeof(float));
+    if (!cur) return WFC_ENOMEM;
+    memcpy(cur, sig, (size_t)snx * sny * sizeof(float));
+    uint32_t cx = snx, cy = sny;
+    while (cx < dnx || cy < dny) {
+        uint32_t nx = cx << 1;
+        uint32_t ny = cy << 1;
+        float* inter;
+        float* next;
+        wfc_err_t err;
+        if (nx > dnx || ny > dny) {
+            faf_aligned_free(cur);
+            return WFC_EINVAL;
+        }
+        inter = (float*)faf_aligned_alloc(2u * (size_t)nx * ny * sizeof(float));
+        next = (float*)faf_aligned_alloc((size_t)nx * ny * sizeof(float));
+        if (!inter || !next) {
+            faf_aligned_free(inter);
+            faf_aligned_free(next);
+            faf_aligned_free(cur);
+            return WFC_ENOMEM;
+        }
+        memset(inter, 0, 2u * (size_t)nx * ny * sizeof(float));
+        for (uint32_t y = 0; y < cy; ++y)
+            for (uint32_t x = 0; x < cx; ++x)
+                inter[2u * ((size_t)y * nx + x)] = cur[(size_t)y * cx + x];
+        err = wfc_hierarchy_idwt_1level(family, inter, nx, ny);
+        if (err != WFC_OK) {
+            faf_aligned_free(inter);
+            faf_aligned_free(next);
+            faf_aligned_free(cur);
+            return err;
+        }
+        for (uint32_t i = 0; i < nx * ny; ++i) next[i] = inter[2u * i];
+        faf_aligned_free(inter);
+        faf_aligned_free(cur);
+        cur = next;
+        cx = nx;
+        cy = ny;
+    }
+    memcpy(dst, cur, (size_t)dnx * dny * sizeof(float));
+    faf_aligned_free(cur);
+    return WFC_OK;
+}
+
+/* z -= R_k. Pure approximation passes a null detail field (details stay in z
+ * until the finer level that is biased by them). */
+static wfc_err_t wfc_hierarchy_subtract_level(wfc_world_t* parent, wfc_hierarchy_t* h,
+                                              uint32_t level, const float* detail_full)
+{
+    wfc_scale_t* scale = &h->levels[level];
+    uint32_t nxy = parent->nx_p2 * parent->ny_p2;
+    float* sig;
+    float* full;
+    wfc_err_t err;
+    if (!h->running) return WFC_OK;
+    sig = (float*)faf_aligned_alloc((size_t)scale->ncells * sizeof(float));
+    full = (float*)faf_aligned_alloc((size_t)nxy * sizeof(float));
+    if (!sig || !full) {
+        faf_aligned_free(sig);
+        faf_aligned_free(full);
+        return WFC_ENOMEM;
+    }
+    for (uint32_t i = 0; i < scale->ncells; ++i)
+        sig[i] = wfc_pattern_signature(parent, scale->coarse_codes[i]);
+    err = wfc_hierarchy_expand_sig(h->wavelet_family, sig, scale->nx, scale->ny,
+                                   full, parent->nx_p2, parent->ny_p2);
+    faf_aligned_free(sig);
+    if (err != WFC_OK) { faf_aligned_free(full); return err; }
+    for (uint32_t i = 0; i < nxy && i < parent->num_cells; ++i)
+        h->running[i] -= full[i];
+    faf_aligned_free(full);
+    if (detail_full) {
+        for (uint32_t i = 0; i < nxy && i < parent->num_cells; ++i)
+            h->running[i] -= detail_full[i];
+    }
+    return WFC_OK;
+}
+
+static wfc_err_t wfc_hierarchy_solve_scale(wfc_world_t* parent, wfc_scale_t* scale,
+                                           int write_back, int guide,
+                                           const float* observation)
+{
+    wfc_world_t* lw = wfc_hierarchy_create_level_world(parent, scale);
+    wfc_err_t err;
+    if (!lw) return WFC_ENOMEM;
+    if (lw->spectral_enabled && lw->spectral_field) {
+        if (!guide) lw->spectral_guides_choice = 0;
+        else if (observation)
+            memcpy(lw->spectral_field, observation, (size_t)scale->ncells * sizeof(float));
+    }
+    err = wfc_collapse(lw);
+    if (err != WFC_OK) { wfc_world_destroy(lw); return err; }
+    for (uint32_t y = 0; y < scale->ny; ++y)
+        for (uint32_t x = 0; x < scale->nx; ++x)
+            scale->coarse_codes[y * scale->nx + x] =
+                lw->cells[wfc_idx(lw, x, y, 0)].collapsed;
+    if (write_back) {
+        for (uint32_t y = 0; y < parent->ny; ++y) {
+            for (uint32_t x = 0; x < parent->nx; ++x) {
+                uint32_t dst = wfc_idx(parent, x, y, 0);
+                uint32_t src = wfc_idx(lw, x, y, 0);
+                parent->cells[dst].collapsed = lw->cells[src].collapsed;
+                memcpy(parent->cells[dst].mask, lw->cells[src].mask,
+                       sizeof(parent->cells[dst].mask));
+                parent->cells[dst].entropy = lw->cells[src].entropy;
+                parent->cells[dst].dirty = 0;
+            }
+        }
+    }
+    parent->rng_state = lw->rng_state;
+    wfc_world_destroy(lw);
     return WFC_OK;
 }
 
@@ -2721,113 +3399,189 @@ static wfc_err_t wfc_hierarchy_upsample(wfc_world_t* fine_lw,
     return err;
 }
 
-/* Residual cascade: coarse → fine.
- * The Gaussian observes a signature, in the same space as wfc_pattern_signature.
- *   k = 0, with a target: the low-passed projection of that target.
- *   k = 0, no target: no likelihood. A zero field would pull every signature
- *          toward 0, so guides_choice stays off.
- *   k > 0, with a target: (1-α) * upsample(coarse) + α * projected target,
- *          α = 2^(-shift). The finest level has α = 1, so it observes the
- *          projected target. Coarser octaves stay closer to the upsample.
- *   k > 0, no target: the upsampled coarse signatures. α does not shrink them.
- * Coarse pattern IDs are not locked into the finer world.
- * Finest level writes back to `w`. */
-wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w)
+/* Coarse-to-fine. Plans for `depth` are already bound when a target is set.
+ *   k = 0: observe the LL low-pass (pure approximation). Owned details are kept.
+ *   k > 0: residual = upsample(signatures) + spatial synthesis of this level's
+ *          details. Level 1 also adds the coarsest details, which are the
+ *          residual the approximation left behind.
+ *   Then z -= R_k(signatures, and the details this level just explained).
+ *   k = 0 with no target: guides stay off. A zero field would pull every
+ *          signature toward 0. Finer levels with no target observe the upsample.
+ * Coarse pattern ids are not locked. The finest level writes back to `w`. */
+static wfc_err_t wfc_hierarchy_collapse_ctf(wfc_world_t* w)
 {
-    if (!w || !w->hierarchy) return WFC_EUNINIT;
-
-    /* The levels are coupled only through the spectral bias field. With
-     * spectral disabled there is no coupling to apply, so refuse loudly
-     * instead of silently returning an ordinary flat solve. */
-    if (!w->spectral_enabled) return WFC_EUNINIT;
-
     wfc_hierarchy_t* h = w->hierarchy;
+    uint32_t nx = w->nx_p2, ny = w->ny_p2, nxy = nx * ny;
 
     for (uint32_t k = 0; k < h->nlevels; ++k) {
         wfc_scale_t* scale = &h->levels[k];
+        int guide = 0;
+        float* detail_full = NULL;
+        wfc_err_t err = WFC_OK;
+
+        if (!h->target_field) {
+            if (k > 0) {
+                wfc_world_t* lw = wfc_hierarchy_create_level_world(w, scale);
+                if (!lw) return WFC_ENOMEM;
+                err = wfc_hierarchy_upsample(lw, w, &h->levels[k - 1],
+                                             scale->recon_field, scale->nx, scale->ny);
+                wfc_world_destroy(lw);
+                if (err != WFC_OK) return err;
+                memcpy(scale->residual_field, scale->recon_field,
+                       (size_t)scale->ncells * sizeof(float));
+                guide = 1;
+            }
+        } else if (k == 0) {
+            guide = 1;
+        } else {
+            wfc_world_t* lw = wfc_hierarchy_create_level_world(w, scale);
+            float* extra = NULL;
+            float* proj = NULL;
+            if (!lw) return WFC_ENOMEM;
+            err = wfc_hierarchy_upsample(lw, w, &h->levels[k - 1],
+                                         scale->recon_field, scale->nx, scale->ny);
+            wfc_world_destroy(lw);
+            if (err != WFC_OK) return err;
+
+            detail_full = (float*)faf_aligned_alloc((size_t)nxy * sizeof(float));
+            extra = (float*)faf_aligned_alloc((size_t)nxy * sizeof(float));
+            proj = (float*)faf_aligned_alloc((size_t)scale->ncells * sizeof(float));
+            if (!detail_full || !extra || !proj) {
+                faf_aligned_free(detail_full);
+                faf_aligned_free(extra);
+                faf_aligned_free(proj);
+                return WFC_ENOMEM;
+            }
+            err = wfc_hierarchy_synth_pack(w, scale, nx, ny, detail_full);
+            if (err == WFC_OK && k == 1)
+                err = wfc_hierarchy_synth_pack(w, &h->levels[0], nx, ny, extra);
+            else if (err == WFC_OK)
+                memset(extra, 0, (size_t)nxy * sizeof(float));
+            if (err != WFC_OK) {
+                faf_aligned_free(detail_full);
+                faf_aligned_free(extra);
+                faf_aligned_free(proj);
+                return err;
+            }
+            for (uint32_t i = 0; i < nxy; ++i) detail_full[i] += extra[i];
+            faf_aligned_free(extra);
+            wfc_hierarchy_project_target(w, detail_full, scale->nx, scale->ny, proj);
+            for (uint32_t i = 0; i < scale->ncells; ++i) {
+                float obs = scale->recon_field[i] + proj[i];
+                if (obs < 0.0f) obs = 0.0f;
+                else if (obs > 1.0f) obs = 1.0f;
+                scale->residual_field[i] = obs;
+            }
+            faf_aligned_free(proj);
+            guide = 1;
+        }
+
+        err = wfc_hierarchy_solve_scale(w, scale, k == h->finest_idx, guide,
+                                        guide ? scale->residual_field : NULL);
+        if (err != WFC_OK) { faf_aligned_free(detail_full); return err; }
+        if (h->target_field) {
+            err = wfc_hierarchy_subtract_level(w, h, k, k == 0 ? NULL : detail_full);
+            faf_aligned_free(detail_full);
+            if (err != WFC_OK) return err;
+        }
+    }
+    return WFC_OK;
+}
+
+/* Fine-to-coarse analysis. Each level is biased by its own detail bands.
+ * The running residual loses that contribution before the next coarser solve.
+ * Only the finest solve writes back. */
+static wfc_err_t wfc_hierarchy_collapse_ftc(wfc_world_t* w)
+{
+    wfc_hierarchy_t* h = w->hierarchy;
+    uint32_t nx = w->nx_p2, ny = w->ny_p2, nxy = nx * ny;
+
+    for (int k = (int)h->nlevels - 1; k >= 0; --k) {
+        wfc_scale_t* scale = &h->levels[k];
+        int guide = 0;
+        float* detail_full = NULL;
         wfc_err_t err;
 
-        wfc_world_t* lw = wfc_hierarchy_create_level_world(w, scale);
-        if (!lw) return WFC_ENOMEM;
-
-        if (lw->spectral_enabled && lw->spectral_field) {
-            if (k == 0) {
-                if (h->target_field) {
-                    wfc_hierarchy_project_target(w, h->target_field,
-                                                 scale->nx, scale->ny,
-                                                 scale->residual_field);
-                    /* Family-dependent low-pass so set_wavelet is live here. */
-                    err = wfc_hierarchy_dwt_lowpass(lw, scale->residual_field,
-                                                    scale->nx, scale->ny);
-                    if (err != WFC_OK) {
-                        wfc_world_destroy(lw);
-                        return err;
-                    }
-                    memcpy(lw->spectral_field, scale->residual_field,
-                           scale->ncells * sizeof(float));
-                } else {
-                    lw->spectral_guides_choice = 0;
-                }
-            } else {
-                wfc_scale_t* prev = &h->levels[k - 1];
-                err = wfc_hierarchy_upsample(lw, w, prev, scale->recon_field,
-                                             scale->nx, scale->ny);
-                if (err != WFC_OK) {
-                    wfc_world_destroy(lw);
-                    return err;
-                }
-                if (h->target_field) {
-                    wfc_hierarchy_project_target(w, h->target_field,
-                                                 scale->nx, scale->ny,
-                                                 scale->residual_field);
-                    float alpha = scale->weight;
-                    for (uint32_t i = 0; i < scale->ncells; ++i) {
-                        float tgt = scale->residual_field[i];
-                        float rec = scale->recon_field[i];
-                        scale->residual_field[i] = rec + alpha * (tgt - rec);
-                    }
-                    memcpy(lw->spectral_field, scale->residual_field,
-                           scale->ncells * sizeof(float));
-                } else {
-                    for (uint32_t i = 0; i < scale->ncells; ++i)
-                        lw->spectral_field[i] = scale->recon_field[i];
-                    memcpy(scale->residual_field, lw->spectral_field,
-                           scale->ncells * sizeof(float));
-                }
+        if (h->target_field && h->running) {
+            float* proj = (float*)faf_aligned_alloc((size_t)scale->ncells * sizeof(float));
+            if (!proj) return WFC_ENOMEM;
+            detail_full = (float*)faf_aligned_alloc((size_t)nxy * sizeof(float));
+            if (!detail_full) { faf_aligned_free(proj); return WFC_ENOMEM; }
+            wfc_hierarchy_project_target(w, h->running, scale->nx, scale->ny,
+                                         scale->residual_field);
+            err = wfc_hierarchy_synth_pack(w, scale, nx, ny, detail_full);
+            if (err != WFC_OK) {
+                faf_aligned_free(proj);
+                faf_aligned_free(detail_full);
+                return err;
             }
+            wfc_hierarchy_project_target(w, detail_full, scale->nx, scale->ny, proj);
+            for (uint32_t i = 0; i < scale->ncells; ++i) {
+                float obs = scale->residual_field[i] + proj[i];
+                if (obs < 0.0f) obs = 0.0f;
+                else if (obs > 1.0f) obs = 1.0f;
+                scale->residual_field[i] = obs;
+            }
+            faf_aligned_free(proj);
+            guide = 1;
         }
 
-        err = wfc_collapse(lw);
+        err = wfc_hierarchy_solve_scale(w, scale, (uint32_t)k == h->finest_idx, guide,
+                                        guide ? scale->residual_field : NULL);
+        if (err != WFC_OK) { faf_aligned_free(detail_full); return err; }
+        if (h->target_field) {
+            err = wfc_hierarchy_subtract_level(w, h, (uint32_t)k, detail_full);
+            faf_aligned_free(detail_full);
+            if (err != WFC_OK) return err;
+        }
+    }
+    return WFC_OK;
+}
+
+/* Residual update, coarse to fine (mode 0) unless set_mode selected analysis.
+ * z^(0) is the target. Each level keeps its LH/HL/HH samples.
+ *   hat z^(k) = hat z^(k-1) + R_k(signatures, details_k)
+ *   z^(k)     = z^(k-1) - hat z^(k)
+ * R_0 is the pure LL approximation (details are not subtracted there).
+ * The next finer observation is the upsampled signatures plus those details.
+ * dwt_levels (0 = full) is how many Mallat octaves that split uses.
+ * adopt_spectral leaves that split in place. Collapse then only copies the
+ * stored target back into the running residual. */
+wfc_err_t wfc_hierarchy_collapse(wfc_world_t* w)
+{
+    wfc_hierarchy_t* h;
+    uint32_t saved;
+    int bound = 0;
+    wfc_err_t err;
+
+    if (!w || !w->hierarchy) return WFC_EUNINIT;
+
+    /* Coupling is the spectral observation. Without it the cascade would be
+     * an ordinary flat solve, so refuse instead of pretending. */
+    if (!w->spectral_enabled) return WFC_EUNINIT;
+
+    h = w->hierarchy;
+    saved = w->faf_wavelet_levels;
+    if (h->target_field) {
+        if (h->decomposed && h->running) {
+            memcpy(h->running, h->target_field, (size_t)w->num_cells * sizeof(float));
+        } else {
+            err = wfc_hierarchy_analyze(w);
+            if (err != WFC_OK) return err;
+        }
+        w->faf_wavelet_family = h->wavelet_family;
+        err = wfc_hierarchy_bind_depth(w, wfc_hierarchy_analysis_depth(h, w->nx_p2, w->ny_p2));
         if (err != WFC_OK) {
-            wfc_world_destroy(lw);
+            wfc_hierarchy_unbind(w, saved);
             return err;
         }
-
-        /* Discrete codes at this scale: feed the next level's upsample. */
-        for (uint32_t y = 0; y < scale->ny; ++y)
-            for (uint32_t x = 0; x < scale->nx; ++x)
-                scale->coarse_codes[y * scale->nx + x] =
-                    lw->cells[wfc_idx(lw, x, y, 0)].collapsed;
-
-        if (k == h->finest_idx) {
-            for (uint32_t y = 0; y < w->ny; ++y) {
-                for (uint32_t x = 0; x < w->nx; ++x) {
-                    uint32_t dst = wfc_idx(w, x, y, 0);
-                    uint32_t src = wfc_idx(lw, x, y, 0);
-                    w->cells[dst].collapsed = lw->cells[src].collapsed;
-                    memcpy(w->cells[dst].mask, lw->cells[src].mask,
-                           sizeof(w->cells[dst].mask));
-                    w->cells[dst].entropy = lw->cells[src].entropy;
-                    w->cells[dst].dirty = 0;
-                }
-            }
-        }
-
-        w->rng_state = lw->rng_state;
-        wfc_world_destroy(lw);
+        bound = 1;
     }
 
-    return WFC_OK;
+    err = (h->mode == 1) ? wfc_hierarchy_collapse_ftc(w)
+                         : wfc_hierarchy_collapse_ctf(w);
+    if (bound) wfc_hierarchy_unbind(w, saved);
+    return err;
 }
 
 void wfc_hierarchy_destroy(wfc_world_t* w)
@@ -2835,12 +3589,17 @@ void wfc_hierarchy_destroy(wfc_world_t* w)
     if (!w || !w->hierarchy) return;
     wfc_hierarchy_t* h = w->hierarchy;
     for (uint32_t k = 0; k < h->nlevels; ++k) {
+        h->levels[k].detail_lh = NULL;
+        h->levels[k].detail_hl = NULL;
+        h->levels[k].detail_hh = NULL;
         faf_aligned_free(h->levels[k].residual_field);
         faf_aligned_free(h->levels[k].recon_field);
         faf_aligned_free(h->levels[k].coarse_codes);
+        faf_aligned_free(h->levels[k].detail_pack);
     }
     WFC_FREE(h->levels);
     faf_aligned_free(h->target_field);
+    faf_aligned_free(h->running);
     WFC_FREE(h);
     w->hierarchy = NULL;
 }

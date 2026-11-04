@@ -6,7 +6,6 @@
 #include "entropic/sobol.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
 
 /* ==========================================================================
@@ -197,17 +196,18 @@ void build_grammar(wfc_world_t* w) {
 /* ==========================================================================
  * Pre-Seed Map using Sobol & Hardcoding
  * ========================================================================== */
-void force_cell(wfc_world_t* w, uint32_t x, uint32_t y, uint32_t z, uint16_t tile) {
-    uint32_t idx = (z * w->ny + y) * w->nx + x;
-    wfc_cell_t* cell = &w->cells[idx];
-    
-    /* Zero out mask and only allow our chosen tile */
-    memset(cell->mask, 0, sizeof(cell->mask));
-    cell->mask[tile >> 6] |= (1ULL << (tile & 63));
-
-    /* FIX 4: Inform the solver engine that this cell has changed constraints 
-     * so it fires initial propagation before deciding the first wavefront collapse step! */
-    cell->dirty = 1;
+/* Weight 0 (courtyard air) is not in the support. A mask-only pin is wiped
+ * before AC-3. wfc_fix_cell collapses the cell so the opening propagation
+ * honors it. A cell that is already pinned is left alone. */
+int force_cell(wfc_world_t* w, uint32_t x, uint32_t y, uint32_t z, uint16_t tile) {
+    if (wfc_get_cell_pattern(w, x, y, z) != WFC_PATTERN_INVALID)
+        return 0;
+    wfc_err_t err = wfc_fix_cell(w, x, y, z, tile);
+    if (err != WFC_OK) {
+        fprintf(stderr, "fix_cell(%u,%u,%u) tile %u failed: %d\n", x, y, z, tile, err);
+        return 0;
+    }
+    return 1;
 }
 
 void pre_collapse_seeds(wfc_world_t* w) {
@@ -255,7 +255,8 @@ void pre_collapse_seeds(wfc_world_t* w) {
             }
 
             uint16_t target_tile = (seeded_count % 2 == 0) ? T_CLINIC_WAIT : T_SHRINE_ALTAR;
-            force_cell(w, px, py, pz, target_tile);
+            if (!force_cell(w, px, py, pz, target_tile))
+                continue;
             seeded_count++;
         }
         sob31_free(&sob);
@@ -341,11 +342,12 @@ int main(void) {
     if (err != WFC_OK) {
         printf("Collapse Contradiction Failed (Error %d).\n", err);
         print_ascii_map(w);
-    } else {
-        print_ascii_map(w);
-        export_to_json(w, "kowloon_layout.json");
+        wfc_world_destroy(w);
+        return 1;
     }
 
+    print_ascii_map(w);
+    export_to_json(w, "kowloon_layout.json");
     wfc_world_destroy(w);
     return 0;
 }

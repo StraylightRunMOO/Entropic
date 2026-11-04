@@ -70,15 +70,10 @@ int main() {
             w.hierarchy_init(3);
             w.hierarchy_set_wavelet(3, 0); /* FAF_WAVELET_CDF97, full depth */
             w.set_gumbel_field(0.7, 11);
-            std::vector<float> target(w.num_cells(), 0.0f);
-            /* Copy spectral field through the C pointer as the hierarchy target. */
-            const float* field = w.c_ptr()->spectral_field;
-            if (field) {
-                for (uint32_t i = 0; i < w.num_cells(); i++)
-                    target[i] = field[i];
-            }
-            w.hierarchy_set_target(target);
+            w.hierarchy_adopt_spectral(); /* one split of that fBm */
             w.hierarchy_collapse();
+            std::cout << "coarsest residual energy "
+                      << w.hierarchy_residual_energy(0) << "\n";
             print_preview(w, 2);
         }
 #endif

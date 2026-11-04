@@ -70,8 +70,9 @@ int main(void)
     err = wfc_set_gumbel_field(w, 0.7, 12345);
     if (err != WFC_OK) { fprintf(stderr, "set_gumbel_field failed: %d\n", err); return 1; }
 
-    err = wfc_hierarchy_set_target(w, w->spectral_field, w->num_cells);
-    if (err != WFC_OK) { fprintf(stderr, "set_target failed: %d\n", err); return 1; }
+    /* One Mallat split of that fBm. The cascade starts from those details. */
+    err = wfc_hierarchy_adopt_spectral(w);
+    if (err != WFC_OK) { fprintf(stderr, "adopt_spectral failed: %d\n", err); return 1; }
 
     err = wfc_hierarchy_collapse(w);
     if (err != WFC_OK) { fprintf(stderr, "hierarchy_collapse failed: %d\n", err); return 1; }
@@ -89,7 +90,8 @@ int main(void)
     printf("\nScale levels:\n");
     for (uint32_t k = 0; k < w->hierarchy->nlevels; ++k) {
         wfc_scale_t* s = &w->hierarchy->levels[k];
-        printf("  Level %u: %u x %u (weight=%.3f)\n", k, s->nx, s->ny, s->weight);
+        printf("  Level %u: %u x %u  residual energy %.4f\n",
+               k, s->nx, s->ny, wfc_hierarchy_residual_energy(w, k));
     }
 
     wfc_world_destroy(w);
