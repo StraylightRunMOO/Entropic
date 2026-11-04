@@ -2173,11 +2173,11 @@ wfc_err_t wfc_collapse(wfc_world_t* w)
     }
     wfc_heap_build(w);
 
-    while (w->step_collapsed_count < w->step_target_collapses) {
+    while (w->heap_size > 0) {
         uint32_t collapsed_cell;
         wfc_err_t err = wfc_collapse_one(w, &collapsed_cell);
         if (err != WFC_OK) return err;
-        if (collapsed_cell == WFC_HEAP_INVALID) break; /* nothing left to collapse */
+        if (collapsed_cell == WFC_HEAP_INVALID) break;
         w->step_collapsed_count++;
     }
 
@@ -2204,16 +2204,13 @@ wfc_err_t wfc_step_init(wfc_world_t* w)
 wfc_err_t wfc_step(wfc_world_t* w)
 {
     if (!w || !w->step_mode) return WFC_EINVAL;
-    if (w->step_collapsed_count >= w->step_target_collapses) return WFC_OK;
+    if (w->heap_size == 0) return WFC_OK;
 
     uint32_t collapsed_cell;
     wfc_err_t err = wfc_collapse_one(w, &collapsed_cell);
     if (err != WFC_OK) return err;
     if (collapsed_cell != WFC_HEAP_INVALID) {
         w->step_collapsed_count++;
-    } else if (w->heap_size == 0) {
-        /* No more cells in heap - mark as complete to prevent infinite loop */
-        w->step_collapsed_count = w->step_target_collapses;
     }
     return WFC_OK;
 }
@@ -2221,7 +2218,7 @@ wfc_err_t wfc_step(wfc_world_t* w)
 int wfc_step_done(const wfc_world_t* w)
 {
     if (!w) return 1;
-    return w->step_collapsed_count >= w->step_target_collapses;
+    return w->heap_size == 0;
 }
 
 /* --- Contradiction callback --- */
